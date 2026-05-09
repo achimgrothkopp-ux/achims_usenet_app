@@ -17,38 +17,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from backend.sabnzbd import SABError, SABnzbdClient
 from config import Config
 from core import header_cache, nntp_client, nzb_builder
 from gui.article_view import ArticleView
 from gui.group_panel import GroupPanel
 from gui.header_view import HeaderView
+from gui.health_indicator import HealthIndicator
+from gui.queue_panel import QueuePanel
 
 log = logging.getLogger(__name__)
 
 
 def _suggest_filename(files: list) -> str:
-    """Aus dem ersten File-Stem einen sinnvollen Default-Dateinamen bauen."""
     if not files:
         return "auswahl.nzb"
     stem = files[0].stem.strip().strip('"')
-    # Zeichen, die im FS nervig sind, ersetzen
     for ch in '/\\:*?"<>|':
         stem = stem.replace(ch, "_")
     return (stem or "auswahl") + ".nzb"
-
-
-def _placeholder(title: str, hint: str) -> QWidget:
-    container = QWidget()
-    layout = QVBoxLayout(container)
-    layout.setContentsMargins(8, 8, 8, 8)
-    heading = QLabel(f"<b>{title}</b>")
-    body = QLabel(hint)
-    body.setWordWrap(True)
-    body.setStyleSheet("color: #888;")
-    layout.addWidget(heading)
-    layout.addWidget(body)
-    layout.addStretch(1)
-    return container
 
 
 class MainWindow(QMainWindow):
@@ -57,11 +44,13 @@ class MainWindow(QMainWindow):
         cfg: Config,
         cache: header_cache.HeaderCache,
         pool: nntp_client.NNTPPool,
+        sab: SABnzbdClient | None = None,
     ) -> None:
         super().__init__()
         self._cfg = cfg
         self._cache = cache
         self._pool = pool
+        self._sab = sab
         self.setWindowTitle("Usenet-App")
         self.resize(1280, 860)
 
@@ -69,6 +58,9 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._build_statusbar()
         self._wire_signals()
+
+        if self._sab is not None:
+            self._health.start()
 
         log.info("MainWindow initialisiert")
 
@@ -91,8 +83,8 @@ class MainWindow(QMainWindow):
         self._group_panel = GroupPanel(self._cache, self._pool, self)
         self._header_view = HeaderView(self._cache, self)
         self._article_view = ArticleView(self._pool, self)
+        self._queue_panel = QueuePanel(self._sab, self)
 
-        # Header oben, Artikel unten
         right_splitter = QSplitter(Qt.Orientation.Vertical, self)
         right_splitter.addWidget(self._header_view)
         right_splitter.addWidget(self._article_view)
@@ -100,7 +92,6 @@ class MainWindow(QMainWindow):
         right_splitter.setStretchFactor(1, 2)
         right_splitter.setSizes([520, 340])
 
-        # Gruppen links, (Header/Artikel) rechts
         inner = QSplitter(Qt.Orientation.Horizontal, self)
         inner.addWidget(self._group_panel)
         inner.addWidget(right_splitter)
@@ -108,18 +99,12 @@ class MainWindow(QMainWindow):
         inner.setStretchFactor(1, 5)
         inner.setSizes([260, 1020])
 
-        # Queue-Panel als Platzhalter unten (Phase 5)
         outer = QSplitter(Qt.Orientation.Vertical, self)
         outer.addWidget(inner)
-        outer.addWidget(
-            _placeholder(
-                "SABnzbd-Queue",
-                "Phase 5: Live-Status der SAB-Download-Queue.",
-            )
-        )
-        outer.setStretchFactor(0, 5)
+        outer.addWidget(self._queue_panel)
+        outer.setStretchFactor(0, 4)
         outer.setStretchFactor(1, 1)
-        outer.setSizes([700, 140])
+        outer.setSizes([660, 200])
 
         self.setCentralWidget(outer)
 
@@ -134,6 +119,8 @@ class MainWindow(QMainWindow):
         )
         bar.showMessage(msg)
         self._statusbar = bar
+        self._health = HealthIndicator(self._sab, self)
+        bar.addPermanentWidget(self._health)
 
     def _wire_signals(self) -> None:
         self._group_panel.group_selected.connect(self._on_group_selected)
@@ -200,9 +187,45 @@ class MainWindow(QMainWindow):
         )
 
     def _on_submit_sab(self, articles: list) -> None:
-        QMessageBox.information(
-            self,
-            "Phase 5",
-            "SABnzbd-Integration kommt in Phase 5. Bitte vorerst über "
-            "'NZB speichern…' und manuell einreichen.",
+        if self._sab is None or not self._sab.configured:
+            QMessageBox.warning(
+                self,
+                "SABnzbd nicht konfiguriert",
+                "Trage in ~/.config/usenet-app/config.toml unter "
+                "[sabnzbd] api_key ein und starte die App neu.",
+            )
+            return
+        if not articles:
+            return
+        asyncio.ensure_future(self._submit_sab_async(articles))
+
+    async def _submit_sab_async(self, articles: list) -> None:
+        files = nzb_builder.group_articles(articles)
+        default_name = _suggest_filename(files)
+        try:
+            xml = nzb_builder.build_nzb_xml(articles, title=Path(default_name).stem)
+            nzb_builder.validate_nzb(xml)
+        except Exception as exc:
+            log.exception("NZB-Erstellung fehlgeschlagen")
+            QMessageBox.critical(self, "NZB-Fehler", str(exc))
+            return
+
+        self._statusbar.showMessage(f"Sende NZB an SABnzbd: {default_name} …")
+        try:
+            assert self._sab is not None
+            nzo_id = await self._sab.add_nzb_bytes(xml, filename=default_name)
+        except SABError as exc:
+            log.warning("SAB-Submit fehlgeschlagen: %s", exc)
+            self._statusbar.showMessage(f"SAB-Fehler: {exc}", 6000)
+            return
+        log.info("NZB an SAB übergeben: nzo_id=%s", nzo_id)
+        self._statusbar.showMessage(
+            f"In SABnzbd-Queue: {default_name} (nzo_id={nzo_id})",
+            5000,
         )
+        self._queue_panel.trigger_refresh()
+
+    def shutdown(self) -> None:
+        """Vom main-Loop aufgerufen, bevor die Loop schließt."""
+        self._queue_panel.stop()
+        self._health.stop()

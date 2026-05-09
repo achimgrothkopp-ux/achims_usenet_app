@@ -7,6 +7,7 @@ import sys
 import qasync
 from PySide6.QtWidgets import QApplication
 
+from backend.sabnzbd import SABnzbdClient
 from config import load as load_config
 from core import header_cache, nntp_client
 from core.logging_setup import configure as configure_logging
@@ -31,19 +32,27 @@ def main() -> None:
     cache = header_cache.HeaderCache(cfg.storage.header_cache_path)
     cache.init_schema()
     pool = nntp_client.NNTPPool(cfg.nntp)
+    sab = SABnzbdClient(cfg.sabnzbd)
 
-    window = MainWindow(cfg, cache, pool)
+    window = MainWindow(cfg, cache, pool, sab=sab)
     window.show()
 
     app_close_event = asyncio.Event()
     app.aboutToQuit.connect(app_close_event.set)
 
+    async def _wait_and_cleanup() -> None:
+        await app_close_event.wait()
+        window.shutdown()
+
     with loop:
-        loop.run_until_complete(app_close_event.wait())
+        loop.run_until_complete(_wait_and_cleanup())
 
     log.info("Shutdown – schließe Pool und Cache")
     pool.close()
     cache.close()
+    # sab.aclose() würde hier die anyio-Cancel-Scope brauchen, aber
+    # qasync hat den Loop schon abgebaut – Prozess-Exit räumt die
+    # offenen Sockets sauber weg (gleiches Muster wie bei NNTPPool).
 
 
 if __name__ == "__main__":
