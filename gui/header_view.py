@@ -312,6 +312,49 @@ class HeaderView(QWidget):
     def model(self) -> HeaderModel:
         return self._model
 
+    def table(self) -> QTableView:
+        return self._table
+
+    def next_row(self) -> None:
+        self._step(+1)
+
+    def prev_row(self) -> None:
+        self._step(-1)
+
+    def _step(self, delta: int) -> None:
+        proxy = self._table.model()
+        rows = proxy.rowCount()
+        if rows == 0:
+            return
+        cur = self._table.currentIndex()
+        target = cur.row() + delta if cur.isValid() else (0 if delta > 0 else rows - 1)
+        target = max(0, min(rows - 1, target))
+        idx = proxy.index(target, _COL_NUMBER)
+        self._table.setCurrentIndex(idx)
+        self._table.scrollTo(idx)
+        # Body sofort laden (entspricht Doppelklick)
+        src = proxy.mapToSource(idx)
+        article = self._model.article_at(src.row())
+        if article is not None:
+            self.article_activated.emit(article)
+
+    def toggle_mark_current(self) -> None:
+        proxy = self._table.model()
+        cur = self._table.currentIndex()
+        if not cur.isValid():
+            return
+        check_idx = proxy.index(cur.row(), _COL_CHECK)
+        src = proxy.mapToSource(check_idx)
+        current = self._model.data(src, Qt.ItemDataRole.CheckStateRole)
+        new_state = (
+            Qt.CheckState.Unchecked
+            if current == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        self._model.setData(src, new_state, Qt.ItemDataRole.CheckStateRole)
+        # Cursor auf nächste Zeile (J/Space-Workflow)
+        self._step(+1)
+
     def _run_search(self) -> None:
         query = self._search.text().strip()
         if not query:

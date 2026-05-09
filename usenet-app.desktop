@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Usenet-App
+GenericName=Newsreader
+Comment=Usenet-Reader mit NZB-Builder und SABnzbd-Anbindung
+Exec=/home/achim/Entwicklung/usenet/.venv/bin/python /home/achim/Entwicklung/usenet/main.py
+Path=/home/achim/Entwicklung/usenet
+Terminal=false
+Categories=Network;News;
+Keywords=usenet;news;nntp;nzb;sabnzbd;
+StartupNotify=true

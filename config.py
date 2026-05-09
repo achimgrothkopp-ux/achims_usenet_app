@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import tomli_w
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "usenet-app"
 CONFIG_PATH = CONFIG_DIR / "config.toml"
@@ -82,3 +84,53 @@ def load(path: Path = CONFIG_PATH) -> Config:
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         source_path=path,
     )
+
+
+def save(cfg: Config, path: Path = CONFIG_PATH) -> None:
+    """Schreibt die konfigurierbaren Sektionen zurück nach TOML.
+
+    Wir berühren nur Felder, die der Settings-Dialog anbieten soll.
+    Andere Sektionen (storage, logging) werden aus der bestehenden
+    Datei übernommen, falls vorhanden – sonst Defaults.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if path.exists():
+        with path.open("rb") as fh:
+            existing = tomllib.load(fh)
+
+    existing["nntp"] = {
+        "host": cfg.nntp.host,
+        "port": cfg.nntp.port,
+        "use_tls": cfg.nntp.use_tls,
+        "username": cfg.nntp.username,
+        "password": cfg.nntp.password,
+        "connections": cfg.nntp.connections,
+    }
+    existing["sabnzbd"] = {
+        "url": cfg.sabnzbd.url,
+        "api_key": cfg.sabnzbd.api_key,
+    }
+    # storage / logging unverändert lassen, falls schon da
+    existing.setdefault("storage", {"header_cache_path": ""})
+    existing.setdefault("logging", {"level": cfg.logging.level})
+
+    with path.open("wb") as fh:
+        tomli_w.dump(existing, fh)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def with_updates(
+    cfg: Config,
+    *,
+    nntp: NNTPConfig | None = None,
+    sabnzbd: SABnzbdConfig | None = None,
+) -> Config:
+    """Liefert eine Kopie von cfg mit ausgetauschten Sektionen."""
+    new_nntp = nntp if nntp is not None else cfg.nntp
+    new_sab = sabnzbd if sabnzbd is not None else cfg.sabnzbd
+    return replace(cfg, nntp=new_nntp, sabnzbd=new_sab)

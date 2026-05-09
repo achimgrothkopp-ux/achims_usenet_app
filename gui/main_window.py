@@ -4,27 +4,28 @@ import asyncio
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
-    QLabel,
     QMainWindow,
     QMessageBox,
     QSplitter,
     QStatusBar,
-    QVBoxLayout,
     QWidget,
 )
 
 from backend.sabnzbd import SABError, SABnzbdClient
 from config import Config
+from config import save as save_config
+from config import with_updates as cfg_with_updates
 from core import header_cache, nntp_client, nzb_builder
 from gui.article_view import ArticleView
 from gui.group_panel import GroupPanel
 from gui.header_view import HeaderView
 from gui.health_indicator import HealthIndicator
 from gui.queue_panel import QueuePanel
+from gui.settings_dialog import SettingsDialog
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class MainWindow(QMainWindow):
         self._cache = cache
         self._pool = pool
         self._sab = sab
+        self._settings = QSettings("local", "Usenet-App")
         self.setWindowTitle("Usenet-App")
         self.resize(1280, 860)
 
@@ -58,26 +60,40 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._build_statusbar()
         self._wire_signals()
+        self._install_shortcuts()
+        self._restore_layout()
 
         if self._sab is not None:
             self._health.start()
 
         log.info("MainWindow initialisiert")
 
+    # ---- UI-Aufbau -----------------------------------------------------
+
     def _build_menubar(self) -> None:
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&Datei")
+        settings_action = QAction("&Einstellungen…", self)
+        settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        settings_action.triggered.connect(self._open_settings)
+        file_menu.addAction(settings_action)
+
+        file_menu.addSeparator()
         quit_action = QAction("&Beenden", self)
         quit_action.setShortcut(QKeySequence.StandardKey.Quit)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
         view_menu = menubar.addMenu("&Ansicht")
-        view_menu.setEnabled(False)
+        reset_layout = QAction("Layout zurücksetzen", self)
+        reset_layout.triggered.connect(self._reset_layout)
+        view_menu.addAction(reset_layout)
 
         help_menu = menubar.addMenu("&Hilfe")
-        help_menu.setEnabled(False)
+        about_action = QAction("&Über Usenet-App…", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
 
     def _build_central(self) -> None:
         self._group_panel = GroupPanel(self._cache, self._pool, self)
@@ -85,28 +101,28 @@ class MainWindow(QMainWindow):
         self._article_view = ArticleView(self._pool, self)
         self._queue_panel = QueuePanel(self._sab, self)
 
-        right_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        right_splitter.addWidget(self._header_view)
-        right_splitter.addWidget(self._article_view)
-        right_splitter.setStretchFactor(0, 3)
-        right_splitter.setStretchFactor(1, 2)
-        right_splitter.setSizes([520, 340])
+        self._right_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self._right_splitter.addWidget(self._header_view)
+        self._right_splitter.addWidget(self._article_view)
+        self._right_splitter.setStretchFactor(0, 3)
+        self._right_splitter.setStretchFactor(1, 2)
+        self._right_splitter.setSizes([520, 340])
 
-        inner = QSplitter(Qt.Orientation.Horizontal, self)
-        inner.addWidget(self._group_panel)
-        inner.addWidget(right_splitter)
-        inner.setStretchFactor(0, 1)
-        inner.setStretchFactor(1, 5)
-        inner.setSizes([260, 1020])
+        self._inner_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self._inner_splitter.addWidget(self._group_panel)
+        self._inner_splitter.addWidget(self._right_splitter)
+        self._inner_splitter.setStretchFactor(0, 1)
+        self._inner_splitter.setStretchFactor(1, 5)
+        self._inner_splitter.setSizes([260, 1020])
 
-        outer = QSplitter(Qt.Orientation.Vertical, self)
-        outer.addWidget(inner)
-        outer.addWidget(self._queue_panel)
-        outer.setStretchFactor(0, 4)
-        outer.setStretchFactor(1, 1)
-        outer.setSizes([660, 200])
+        self._outer_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self._outer_splitter.addWidget(self._inner_splitter)
+        self._outer_splitter.addWidget(self._queue_panel)
+        self._outer_splitter.setStretchFactor(0, 4)
+        self._outer_splitter.setStretchFactor(1, 1)
+        self._outer_splitter.setSizes([660, 200])
 
-        self.setCentralWidget(outer)
+        self.setCentralWidget(self._outer_splitter)
 
     def _build_statusbar(self) -> None:
         bar = QStatusBar(self)
@@ -128,6 +144,66 @@ class MainWindow(QMainWindow):
         self._header_view.article_activated.connect(self._article_view.show_article)
         self._header_view.save_nzb_requested.connect(self._on_save_nzb)
         self._header_view.submit_sab_requested.connect(self._on_submit_sab)
+
+    def _install_shortcuts(self) -> None:
+        # vi-style Newsreader-Shortcuts (gelten global, weil sie nur
+        # Sinn ergeben wenn Header-View aktiv ist – sie no-op'en sonst).
+        QShortcut(QKeySequence("J"), self, activated=self._header_view.next_row)
+        QShortcut(QKeySequence("K"), self, activated=self._header_view.prev_row)
+        QShortcut(QKeySequence("Space"), self, activated=self._header_view.toggle_mark_current)
+
+    # ---- Layout-Persistenz ---------------------------------------------
+
+    def _restore_layout(self) -> None:
+        s = self._settings
+        geom = s.value("window/geometry")
+        if geom is not None:
+            self.restoreGeometry(geom)
+        for splitter, key in (
+            (self._outer_splitter, "splitter/outer"),
+            (self._inner_splitter, "splitter/inner"),
+            (self._right_splitter, "splitter/right"),
+        ):
+            state = s.value(key)
+            if state is not None:
+                splitter.restoreState(state)
+        for header, key in self._persistable_headers():
+            state = s.value(key)
+            if state is not None:
+                header.restoreState(state)
+
+    def _save_layout(self) -> None:
+        s = self._settings
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("splitter/outer", self._outer_splitter.saveState())
+        s.setValue("splitter/inner", self._inner_splitter.saveState())
+        s.setValue("splitter/right", self._right_splitter.saveState())
+        for header, key in self._persistable_headers():
+            s.setValue(key, header.saveState())
+
+    def _persistable_headers(self):
+        return [
+            (self._header_view.table().horizontalHeader(), "header_table/header_state"),
+            (self._queue_panel.table().horizontalHeader(), "queue_table/header_state"),
+        ]
+
+    def _reset_layout(self) -> None:
+        for key in (
+            "window/geometry",
+            "splitter/outer",
+            "splitter/inner",
+            "splitter/right",
+            "header_table/header_state",
+            "queue_table/header_state",
+        ):
+            self._settings.remove(key)
+        QMessageBox.information(
+            self,
+            "Layout zurückgesetzt",
+            "Beim nächsten App-Start werden die Default-Größen wiederhergestellt.",
+        )
+
+    # ---- Slots ---------------------------------------------------------
 
     def _on_group_selected(self, name: str) -> None:
         log.info("Gruppe gewählt: %s", name)
@@ -224,6 +300,47 @@ class MainWindow(QMainWindow):
             5000,
         )
         self._queue_panel.trigger_refresh()
+
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self._cfg, self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        new_cfg = cfg_with_updates(
+            self._cfg,
+            nntp=dlg.collected_nntp(),
+            sabnzbd=dlg.collected_sab(),
+        )
+        try:
+            target = self._cfg.source_path
+            if target is None:
+                from config import CONFIG_PATH
+                target = CONFIG_PATH
+            save_config(new_cfg, target)
+        except Exception as exc:
+            log.exception("Settings speichern fehlgeschlagen")
+            QMessageBox.critical(self, "Fehler beim Speichern", str(exc))
+            return
+        self._cfg = new_cfg
+        QMessageBox.information(
+            self,
+            "Einstellungen gespeichert",
+            "Die Änderungen greifen beim nächsten App-Start.",
+        )
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "Über Usenet-App",
+            "<h3>Usenet-App</h3>"
+            "<p>Newsreader + NZB-Builder mit SABnzbd-Anbindung.</p>"
+            "<p>Phase 6-Build · Python 3.13 · PySide6 · pynntp · httpx · lxml</p>",
+        )
+
+    # ---- Lifecycle -----------------------------------------------------
+
+    def closeEvent(self, event) -> None:
+        self._save_layout()
+        super().closeEvent(event)
 
     def shutdown(self) -> None:
         """Vom main-Loop aufgerufen, bevor die Loop schließt."""

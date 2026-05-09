@@ -139,6 +139,9 @@ class QueuePanel(QWidget):
 
     # ---- Public ---------------------------------------------------------
 
+    def table(self) -> QTableView:
+        return self._table
+
     def trigger_refresh(self) -> None:
         """Ruft auch außerhalb des Timers eine sofortige Aktualisierung ab."""
         self._tick()
