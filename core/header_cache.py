@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -80,6 +81,18 @@ class SearchHit:
     from_addr: str
 
 
+@dataclass(frozen=True)
+class ArticleRow:
+    group: str
+    number: int
+    message_id: str
+    subject: str
+    from_addr: str
+    date: str
+    bytes: int
+    lines: int
+
+
 class HeaderCache:
     """SQLite-Wrapper. Sync; Aufrufer wickelt I/O ggf. mit asyncio.to_thread."""
 
@@ -88,12 +101,17 @@ class HeaderCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Eine sqlite3.Connection ist nicht thread-safe; wir greifen aus
+        # GUI-Thread und Worker-Threads (asyncio.to_thread) zu.
+        self._lock = threading.RLock()
 
     def init_schema(self) -> None:
-        self._conn.executescript(SCHEMA)
+        with self._lock:
+            self._conn.executescript(SCHEMA)
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ---- Groups ----------------------------------------------------------
 
@@ -105,46 +123,50 @@ class HeaderCache:
         last_seen: int | None,
         status: str | None,
     ) -> None:
-        if last_seen is None:
-            row = self._conn.execute(
-                "SELECT last_article_seen FROM groups WHERE name = ?", (name,)
-            ).fetchone()
-            last_seen = row["last_article_seen"] if row else 0
-        self._conn.execute(
-            """
-            INSERT INTO groups(name, low_number, high_number, last_article_seen, status)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                low_number  = excluded.low_number,
-                high_number = excluded.high_number,
-                last_article_seen = excluded.last_article_seen,
-                status = COALESCE(excluded.status, groups.status)
-            """,
-            (name, low, high, last_seen, status),
-        )
+        with self._lock:
+            if last_seen is None:
+                row = self._conn.execute(
+                    "SELECT last_article_seen FROM groups WHERE name = ?", (name,)
+                ).fetchone()
+                last_seen = row["last_article_seen"] if row else 0
+            self._conn.execute(
+                """
+                INSERT INTO groups(name, low_number, high_number, last_article_seen, status)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    low_number  = excluded.low_number,
+                    high_number = excluded.high_number,
+                    last_article_seen = excluded.last_article_seen,
+                    status = COALESCE(excluded.status, groups.status)
+                """,
+                (name, low, high, last_seen, status),
+            )
 
     def set_subscribed(self, name: str, subscribed: bool) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO groups(name, subscribed) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET subscribed = excluded.subscribed
-            """,
-            (name, 1 if subscribed else 0),
-        )
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO groups(name, subscribed) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET subscribed = excluded.subscribed
+                """,
+                (name, 1 if subscribed else 0),
+            )
 
     def list_subscribed(self) -> list[GroupRow]:
-        rows = self._conn.execute(
-            "SELECT name, low_number, high_number, last_article_seen, subscribed, status "
-            "FROM groups WHERE subscribed = 1 ORDER BY name"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, low_number, high_number, last_article_seen, subscribed, status "
+                "FROM groups WHERE subscribed = 1 ORDER BY name"
+            ).fetchall()
         return [self._group_row(r) for r in rows]
 
     def get_group(self, name: str) -> GroupRow | None:
-        row = self._conn.execute(
-            "SELECT name, low_number, high_number, last_article_seen, subscribed, status "
-            "FROM groups WHERE name = ?",
-            (name,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT name, low_number, high_number, last_article_seen, subscribed, status "
+                "FROM groups WHERE name = ?",
+                (name,),
+            ).fetchone()
         return self._group_row(row) if row else None
 
     @staticmethod
@@ -159,20 +181,22 @@ class HeaderCache:
         )
 
     def get_last_seen(self, name: str) -> int:
-        row = self._conn.execute(
-            "SELECT last_article_seen FROM groups WHERE name = ?", (name,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_article_seen FROM groups WHERE name = ?", (name,)
+            ).fetchone()
         return int(row["last_article_seen"]) if row else 0
 
     def set_last_seen(self, name: str, value: int) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO groups(name, last_article_seen) VALUES (?, ?)
-            ON CONFLICT(name) DO UPDATE SET last_article_seen =
-                MAX(groups.last_article_seen, excluded.last_article_seen)
-            """,
-            (name, int(value)),
-        )
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO groups(name, last_article_seen) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET last_article_seen =
+                    MAX(groups.last_article_seen, excluded.last_article_seen)
+                """,
+                (name, int(value)),
+            )
 
     # ---- Articles --------------------------------------------------------
 
@@ -193,44 +217,73 @@ class HeaderCache:
         if not payload:
             return 0
 
-        cur = self._conn.cursor()
-        cur.execute("BEGIN")
-        try:
-            before = self._conn.execute(
-                "SELECT COUNT(*) FROM articles WHERE group_name = ?", (group,)
-            ).fetchone()[0]
-            cur.executemany(
-                """
-                INSERT INTO articles(group_name, number, message_id, subject, from_addr, date, bytes, lines)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(group_name, number) DO NOTHING
-                """,
-                payload,
-            )
-            after = self._conn.execute(
-                "SELECT COUNT(*) FROM articles WHERE group_name = ?", (group,)
-            ).fetchone()[0]
-            cur.execute("COMMIT")
-        except Exception:
-            cur.execute("ROLLBACK")
-            raise
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                before = self._conn.execute(
+                    "SELECT COUNT(*) FROM articles WHERE group_name = ?", (group,)
+                ).fetchone()[0]
+                cur.executemany(
+                    """
+                    INSERT INTO articles(group_name, number, message_id, subject, from_addr, date, bytes, lines)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(group_name, number) DO NOTHING
+                    """,
+                    payload,
+                )
+                after = self._conn.execute(
+                    "SELECT COUNT(*) FROM articles WHERE group_name = ?", (group,)
+                ).fetchone()[0]
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
         return int(after - before)
 
     def clear_group(self, group: str) -> None:
         """Alles für eine Gruppe löschen (Trigger räumt FTS mit auf)."""
-        self._conn.execute("DELETE FROM articles WHERE group_name = ?", (group,))
-        self._conn.execute(
-            "UPDATE groups SET last_article_seen = 0 WHERE name = ?", (group,)
-        )
+        with self._lock:
+            self._conn.execute("DELETE FROM articles WHERE group_name = ?", (group,))
+            self._conn.execute(
+                "UPDATE groups SET last_article_seen = 0 WHERE name = ?", (group,)
+            )
 
     def article_count(self, group: str | None = None) -> int:
-        if group:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM articles WHERE group_name = ?", (group,)
-            ).fetchone()
-        else:
-            row = self._conn.execute("SELECT COUNT(*) AS c FROM articles").fetchone()
+        with self._lock:
+            if group:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM articles WHERE group_name = ?", (group,)
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT COUNT(*) AS c FROM articles").fetchone()
         return int(row["c"])
+
+    def get_article(self, group: str, number: int) -> ArticleRow | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines "
+                "FROM articles WHERE group_name = ? AND number = ?",
+                (group, number),
+            ).fetchone()
+        return self._article_row(row) if row else None
+
+    def fetch_articles(
+        self,
+        group: str,
+        *,
+        offset: int = 0,
+        limit: int = 500,
+        order: str = "desc",
+    ) -> list[ArticleRow]:
+        order_sql = "DESC" if order.lower() == "desc" else "ASC"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines "
+                f"FROM articles WHERE group_name = ? ORDER BY number {order_sql} LIMIT ? OFFSET ?",
+                (group, int(limit), int(offset)),
+            ).fetchall()
+        return [self._article_row(r) for r in rows]
 
     def search(self, query: str, *, group: str | None = None, limit: int = 50) -> list[SearchHit]:
         params: list = [query]
@@ -244,7 +297,8 @@ class HeaderCache:
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
 
-        rows = self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [
             SearchHit(
                 group=r["group_name"],
@@ -254,3 +308,16 @@ class HeaderCache:
             )
             for r in rows
         ]
+
+    @staticmethod
+    def _article_row(r: sqlite3.Row) -> ArticleRow:
+        return ArticleRow(
+            group=r["group_name"],
+            number=int(r["number"]),
+            message_id=r["message_id"],
+            subject=r["subject"],
+            from_addr=r["from_addr"],
+            date=r["date"],
+            bytes=int(r["bytes"]),
+            lines=int(r["lines"]),
+        )

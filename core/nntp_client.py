@@ -146,14 +146,15 @@ class NNTPPool:
             except Exception:
                 pass
 
-    async def close(self) -> None:
+    def close(self) -> None:
+        """Synchron schließen – wird beim Shutdown nach Loop-Exit aufgerufen."""
         self._closed = True
         while True:
             try:
                 client = self._idle.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            await asyncio.to_thread(self._safe_quit, client)
+            self._safe_quit(client)
 
     # ---- High-Level-Helfer --------------------------------------------------
 
@@ -308,7 +309,7 @@ async def _amain(args: argparse.Namespace) -> int:
                 print(f"  [{hit.group}] #{hit.number}  {hit.subject!r}  ({hit.from_addr})")
 
     finally:
-        await pool.close()
+        pool.close()
         cache.close()
     return 0
 

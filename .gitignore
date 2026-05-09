@@ -13,3 +13,6 @@ dist/
 usenet.txt
 config.toml
 config.local.toml
+
+# Lokale Smoke-Tests (nicht versionieren)
+_*.py
