@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QFileDialog,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -15,12 +18,23 @@ from PySide6.QtWidgets import (
 )
 
 from config import Config
-from core import header_cache, nntp_client
+from core import header_cache, nntp_client, nzb_builder
 from gui.article_view import ArticleView
 from gui.group_panel import GroupPanel
 from gui.header_view import HeaderView
 
 log = logging.getLogger(__name__)
+
+
+def _suggest_filename(files: list) -> str:
+    """Aus dem ersten File-Stem einen sinnvollen Default-Dateinamen bauen."""
+    if not files:
+        return "auswahl.nzb"
+    stem = files[0].stem.strip().strip('"')
+    # Zeichen, die im FS nervig sind, ersetzen
+    for ch in '/\\:*?"<>|':
+        stem = stem.replace(ch, "_")
+    return (stem or "auswahl") + ".nzb"
 
 
 def _placeholder(title: str, hint: str) -> QWidget:
@@ -125,6 +139,8 @@ class MainWindow(QMainWindow):
         self._group_panel.group_selected.connect(self._on_group_selected)
         self._group_panel.sync_requested.connect(self._on_sync_requested)
         self._header_view.article_activated.connect(self._article_view.show_article)
+        self._header_view.save_nzb_requested.connect(self._on_save_nzb)
+        self._header_view.submit_sab_requested.connect(self._on_submit_sab)
 
     def _on_group_selected(self, name: str) -> None:
         log.info("Gruppe gewählt: %s", name)
@@ -144,5 +160,49 @@ class MainWindow(QMainWindow):
             return
         self._statusbar.showMessage(f"Sync {name}: {n} neue Artikel", 5000)
         self._group_panel.refresh()
-        if self._header_view._model.current_group() == name:
+        if self._header_view.model().current_group() == name:
             self._header_view.refresh_current()
+
+    def _on_save_nzb(self, articles: list) -> None:
+        if not articles:
+            return
+        files = nzb_builder.group_articles(articles)
+        default_name = _suggest_filename(files)
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "NZB speichern",
+            str(Path.home() / default_name),
+            "NZB-Dateien (*.nzb)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if path.suffix.lower() != ".nzb":
+            path = path.with_suffix(".nzb")
+        try:
+            xml = nzb_builder.build_nzb_xml(articles, title=path.stem)
+            nzb_builder.validate_nzb(xml)
+            path.write_bytes(xml)
+        except Exception as exc:
+            log.exception("NZB-Erstellung fehlgeschlagen")
+            QMessageBox.critical(self, "NZB-Fehler", str(exc))
+            return
+        log.info(
+            "NZB geschrieben: %s (%s Files, %s Segmente)",
+            path,
+            len(files),
+            sum(len(f.segments) for f in files),
+        )
+        self._statusbar.showMessage(
+            f"NZB gespeichert: {path.name} ({len(files)} Files, "
+            f"{sum(len(f.segments) for f in files)} Segmente)",
+            5000,
+        )
+
+    def _on_submit_sab(self, articles: list) -> None:
+        QMessageBox.information(
+            self,
+            "Phase 5",
+            "SABnzbd-Integration kommt in Phase 5. Bitte vorerst über "
+            "'NZB speichern…' und manuell einreichen.",
+        )

@@ -29,7 +29,8 @@ log = logging.getLogger(__name__)
 _PAGE_SIZE = 500
 _SEARCH_LIMIT = 1000
 
-_COLUMNS = ("Nr.", "Subject", "From", "Datum", "Bytes")
+_COL_CHECK, _COL_NUMBER, _COL_SUBJECT, _COL_FROM, _COL_DATE, _COL_BYTES = range(6)
+_COLUMNS = ("✓", "Nr.", "Subject", "From", "Datum", "Bytes")
 
 
 @dataclass
@@ -40,12 +41,16 @@ class _Mode:
 
 
 class HeaderModel(QAbstractTableModel):
+    marks_changed = Signal(int)
+
     def __init__(self, cache: header_cache.HeaderCache, parent=None) -> None:
         super().__init__(parent)
         self._cache = cache
         self._mode: _Mode = _Mode(kind="browse", group=None)
         self._rows: list[header_cache.ArticleRow] = []
         self._total = 0
+        # Markierungen überleben Mode-Wechsel: Schlüssel (group, number).
+        self._marks: set[tuple[str, int]] = set()
 
     # ---- Mode-Switching --------------------------------------------------
 
@@ -68,7 +73,6 @@ class HeaderModel(QAbstractTableModel):
             log.warning("FTS-Query fehlgeschlagen: %s", exc)
             hits = []
 
-        # Hits → ArticleRow inkl. message_id und Datum
         rows: list[header_cache.ArticleRow] = []
         for hit in hits:
             row = self._cache.get_article(hit.group, hit.number)
@@ -86,7 +90,6 @@ class HeaderModel(QAbstractTableModel):
     def _fill_initial(self) -> None:
         if self._mode.kind != "browse" or not self._mode.group or self._total == 0:
             return
-        # Erste Seite laden
         page = self._cache.fetch_articles(
             self._mode.group, offset=0, limit=_PAGE_SIZE, order="desc"
         )
@@ -114,6 +117,36 @@ class HeaderModel(QAbstractTableModel):
         self._rows.extend(page)
         self.endInsertRows()
 
+    # ---- Markierungen ---------------------------------------------------
+
+    def marked_articles(self) -> list[header_cache.ArticleRow]:
+        """Alle markierten Artikel aus dem Cache holen, in stabiler Reihenfolge.
+
+        Wir arbeiten direkt mit dem Cache statt mit den geladenen
+        Pagen, weil Markierungen Mode-übergreifend gehalten werden und
+        Rows in der UI evtl. noch gar nicht materialisiert sind.
+        """
+        out: list[header_cache.ArticleRow] = []
+        for group, number in sorted(self._marks):
+            row = self._cache.get_article(group, number)
+            if row is not None:
+                out.append(row)
+        return out
+
+    def mark_count(self) -> int:
+        return len(self._marks)
+
+    def clear_marks(self) -> None:
+        if not self._marks:
+            return
+        self._marks.clear()
+        # Alle sichtbaren Zeilen neu zeichnen (CheckStateRole)
+        if self._rows:
+            top = self.index(0, _COL_CHECK)
+            bottom = self.index(len(self._rows) - 1, _COL_CHECK)
+            self.dataChanged.emit(top, bottom, [Qt.ItemDataRole.CheckStateRole])
+        self.marks_changed.emit(0)
+
     # ---- Standard-Model-API ---------------------------------------------
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
@@ -129,22 +162,52 @@ class HeaderModel(QAbstractTableModel):
             return _COLUMNS[section]
         return section + 1
 
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if index.column() == _COL_CHECK:
+            return base | Qt.ItemFlag.ItemIsUserCheckable
+        return base
+
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
         row = self._rows[index.row()]
         col = index.column()
+        if role == Qt.ItemDataRole.CheckStateRole and col == _COL_CHECK:
+            key = (row.group, row.number)
+            return Qt.CheckState.Checked if key in self._marks else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == 0: return row.number
-            if col == 1: return row.subject
-            if col == 2: return row.from_addr
-            if col == 3: return row.date
-            if col == 4: return _fmt_bytes(row.bytes)
+            if col == _COL_NUMBER: return row.number
+            if col == _COL_SUBJECT: return row.subject
+            if col == _COL_FROM: return row.from_addr
+            if col == _COL_DATE: return row.date
+            if col == _COL_BYTES: return _fmt_bytes(row.bytes)
         elif role == Qt.ItemDataRole.ToolTipRole:
             return f"Message-ID: {row.message_id}\nLines: {row.lines}"
         elif role == Qt.ItemDataRole.UserRole:
             return row
         return None
+
+    def setData(self, index: QModelIndex, value, role=Qt.ItemDataRole.EditRole) -> bool:
+        if (
+            not index.isValid()
+            or role != Qt.ItemDataRole.CheckStateRole
+            or index.column() != _COL_CHECK
+        ):
+            return False
+        row = self._rows[index.row()]
+        key = (row.group, row.number)
+        # PySide reicht hier sowohl Qt.CheckState als auch int durch.
+        checked = Qt.CheckState(value) == Qt.CheckState.Checked
+        if checked:
+            self._marks.add(key)
+        else:
+            self._marks.discard(key)
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        self.marks_changed.emit(len(self._marks))
+        return True
 
     def article_at(self, row: int) -> header_cache.ArticleRow | None:
         if 0 <= row < len(self._rows):
@@ -167,12 +230,16 @@ def _fmt_bytes(n: int) -> str:
 
 class HeaderView(QWidget):
     article_activated = Signal(object)  # ArticleRow
+    save_nzb_requested = Signal(list)   # list[ArticleRow]
+    submit_sab_requested = Signal(list)  # list[ArticleRow]
 
     def __init__(self, cache: header_cache.HeaderCache, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._cache = cache
         self._model = HeaderModel(cache, self)
+        self._model.marks_changed.connect(self._on_marks_changed)
         self._build_ui()
+        self._on_marks_changed(0)
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -203,13 +270,31 @@ class HeaderView(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
         hh = self._table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_CHECK, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_NUMBER, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_SUBJECT, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(_COL_FROM, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_BYTES, QHeaderView.ResizeMode.ResizeToContents)
         self._table.doubleClicked.connect(self._on_double_clicked)
         layout.addWidget(self._table, 1)
+
+        action_row = QHBoxLayout()
+        self._mark_status = QLabel("0 markiert", self)
+        action_row.addWidget(self._mark_status)
+        action_row.addStretch(1)
+        self._btn_clear_marks = QPushButton("Auswahl leeren", self)
+        self._btn_clear_marks.clicked.connect(self._model.clear_marks)
+        self._btn_save_nzb = QPushButton("NZB speichern…", self)
+        self._btn_save_nzb.clicked.connect(self._on_save_nzb)
+        self._btn_submit_sab = QPushButton("→ SABnzbd", self)
+        self._btn_submit_sab.setEnabled(False)
+        self._btn_submit_sab.setToolTip("Phase 5: SABnzbd-Integration")
+        self._btn_submit_sab.clicked.connect(self._on_submit_sab)
+        action_row.addWidget(self._btn_clear_marks)
+        action_row.addWidget(self._btn_save_nzb)
+        action_row.addWidget(self._btn_submit_sab)
+        layout.addLayout(action_row)
 
         self._status = QLabel("", self)
         self._status.setStyleSheet("color: #888;")
@@ -221,9 +306,11 @@ class HeaderView(QWidget):
         self._update_status()
 
     def refresh_current(self) -> None:
-        """Neu laden (z.B. nach Sync)."""
         if self._model.current_group():
             self.set_group(self._model.current_group())
+
+    def model(self) -> HeaderModel:
+        return self._model
 
     def _run_search(self) -> None:
         query = self._search.text().strip()
@@ -249,10 +336,27 @@ class HeaderView(QWidget):
         else:
             self._status.setText(f"{grp}: {total} Artikel im Cache")
 
+    def _on_marks_changed(self, count: int) -> None:
+        self._mark_status.setText(f"{count} markiert")
+        self._btn_save_nzb.setEnabled(count > 0)
+        self._btn_clear_marks.setEnabled(count > 0)
+
     def _on_double_clicked(self, proxy_index) -> None:
-        # Übersetze Proxy → Source-Row
         proxy = self._table.model()
         src_index = proxy.mapToSource(proxy_index)
+        # Doppelklick auf die Check-Spalte schaltet Häkchen, nicht Body
+        if src_index.column() == _COL_CHECK:
+            return
         article = self._model.article_at(src_index.row())
         if article is not None:
             self.article_activated.emit(article)
+
+    def _on_save_nzb(self) -> None:
+        marked = self._model.marked_articles()
+        if marked:
+            self.save_nzb_requested.emit(marked)
+
+    def _on_submit_sab(self) -> None:
+        marked = self._model.marked_articles()
+        if marked:
+            self.submit_sab_requested.emit(marked)
