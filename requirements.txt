@@ -1,0 +1,12 @@
+# GUI
+PySide6>=6.7
+qasync>=0.27
+
+# NNTP (nntplib ist in Python 3.13 entfernt)
+pynntp>=2.0
+
+# HTTP-Client für SABnzbd-API und spaeter Newznab-Indexer
+httpx>=0.27
+
+# NZB-XML
+lxml>=5.2

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.idea/
+.vscode/
+*.egg-info/
+build/
+dist/
+
+# Lokale Credentials & Notizen
+usenet.txt
+config.toml
+config.local.toml

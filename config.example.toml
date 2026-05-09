@@ -1,0 +1,24 @@
+# Usenet-App – Beispiel-Konfiguration
+#
+# Dies ist nur ein Template. Lege deine echte Config unter
+#   ~/.config/usenet-app/config.toml
+# an (chmod 600). Diese Beispiel-Datei wird nicht gelesen.
+
+[nntp]
+host = "news.newshosting.com"
+port = 563
+use_tls = true
+username = "your-newshosting-username"
+password = "your-newshosting-password"
+connections = 8
+
+[sabnzbd]
+url = "http://127.0.0.1:8080"
+api_key = "paste-from-sabnzbd-config"
+
+[storage]
+# Leerer String → Default ~/.local/share/usenet-app/header_cache.sqlite3
+header_cache_path = ""
+
+[logging]
+level = "INFO"
