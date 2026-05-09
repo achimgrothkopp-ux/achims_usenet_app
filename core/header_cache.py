@@ -242,12 +242,35 @@ class HeaderCache:
         return int(after - before)
 
     def clear_group(self, group: str) -> None:
-        """Alles für eine Gruppe löschen (Trigger räumt FTS mit auf)."""
+        """Alles für eine Gruppe löschen.
+
+        Der per-row AFTER-DELETE-Trigger auf articles würde bei großen
+        Gruppen (Mio Zeilen) jede Löschung einzeln im FTS-Index suchen,
+        was Stunden dauern kann. Wir droppen den Trigger kurzzeitig,
+        machen zwei Bulk-DELETEs und stellen den Trigger wieder her.
+        """
         with self._lock:
-            self._conn.execute("DELETE FROM articles WHERE group_name = ?", (group,))
-            self._conn.execute(
-                "UPDATE groups SET last_article_seen = 0 WHERE name = ?", (group,)
-            )
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.execute("DROP TRIGGER IF EXISTS articles_ad")
+                cur.execute("DELETE FROM articles_fts WHERE group_name = ?", (group,))
+                cur.execute("DELETE FROM articles WHERE group_name = ?", (group,))
+                cur.execute(
+                    "UPDATE groups SET last_article_seen = 0 WHERE name = ?", (group,)
+                )
+                cur.execute(
+                    """
+                    CREATE TRIGGER articles_ad AFTER DELETE ON articles BEGIN
+                        DELETE FROM articles_fts
+                         WHERE group_name = old.group_name AND number = old.number;
+                    END
+                    """
+                )
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
 
     def article_count(self, group: str | None = None) -> int:
         with self._lock:

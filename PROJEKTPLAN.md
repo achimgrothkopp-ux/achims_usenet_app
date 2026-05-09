@@ -156,6 +156,18 @@ Sobald ein Indexer-Account existiert. Additiv – greift nicht in Phase 1–6 ei
 - `search_view.py`: separater Tab/Panel für Indexer-Suche
 - Direkt-Übergabe an SABnzbd
 
+### Phase 8 – Group-Browser  *(geplant)*
+
+Beim Klick auf "Abonnieren…" muss man aktuell den Gruppennamen exakt
+kennen. Stattdessen:
+
+- LIST ACTIVE einmal pro Session ziehen (Newshosting liefert ~100k
+  Gruppen, ~5–10 MB) und im Cache (`groups`-Tabelle) ablegen
+- `gui/group_browser.py`: QTreeView nach Hierarchie
+  (`alt.binaries.*`, `de.alt.*` etc.) plus Filter-Suche
+- Mehrfach-Subscribe in einem Schritt
+- Spalten: Name, Artikel-Anzahl, ggf. Status
+
 ---
 
 ## Geschätzter Gesamtumfang
