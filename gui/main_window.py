@@ -15,21 +15,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import time
+
 from backend.sabnzbd import SABError, SABnzbdClient
 from config import Config
 from config import save as save_config
 from config import with_updates as cfg_with_updates
 from core import header_cache, nntp_client, nzb_builder
 from gui.article_view import ArticleView
-from gui.dialogs import confirm_async, critical_later
+from gui.dialogs import critical_later
 from gui.group_panel import GroupPanel
 from gui.header_view import HeaderView
 from gui.health_indicator import HealthIndicator
 from gui.queue_panel import QueuePanel
 from gui.settings_dialog import SettingsDialog
+from gui.sync_dialog import SyncDialog
 
-
-SYNC_WARN_THRESHOLD = 1_000_000  # ab so vielen neuen Artikeln vorher fragen
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +58,9 @@ class MainWindow(QMainWindow):
         self._pool = pool
         self._sab = sab
         self._settings = QSettings("local", "Usenet-App")
-        self._syncing: set[str] = set()
+        # Pro laufendem Sync ein Cancel-Event; Stop-Button setzt das Event,
+        # die sync_group-Schleife checkt es zwischen Chunks.
+        self._syncing: dict[str, asyncio.Event] = {}
         self.setWindowTitle("Usenet-App")
         self.resize(1280, 860)
 
@@ -146,6 +149,7 @@ class MainWindow(QMainWindow):
     def _wire_signals(self) -> None:
         self._group_panel.group_selected.connect(self._on_group_selected)
         self._group_panel.sync_requested.connect(self._on_sync_requested)
+        self._group_panel.cancel_requested.connect(self._on_cancel_requested)
         self._header_view.article_activated.connect(self._article_view.show_article)
         self._header_view.save_nzb_requested.connect(self._on_save_nzb)
         self._header_view.submit_sab_requested.connect(self._on_submit_sab)
@@ -219,15 +223,22 @@ class MainWindow(QMainWindow):
         if name in self._syncing:
             self._statusbar.showMessage(f"Sync für {name} läuft bereits", 3000)
             return
-        # Lock SYNCHRON setzen, sonst gewinnt ein Doppelklick das Rennen
-        # bevor der erste Task überhaupt geschedult wurde.
-        self._syncing.add(name)
+        # Lock + Event SYNCHRON setzen, sonst gewinnt ein Doppelklick das
+        # Rennen, bevor der erste Task überhaupt geschedult wurde.
+        event = asyncio.Event()
+        self._syncing[name] = event
         self._group_panel.set_sync_running(name, True)
-        asyncio.ensure_future(self._sync_async(name))
+        asyncio.ensure_future(self._sync_flow(name, event))
 
-    async def _sync_async(self, name: str) -> None:
+    def _on_cancel_requested(self, name: str) -> None:
+        event = self._syncing.get(name)
+        if event is None:
+            return
+        event.set()
+        self._statusbar.showMessage(f"Sync-Stop für {name} angefordert …", 3000)
+
+    async def _sync_flow(self, name: str, cancel: asyncio.Event) -> None:
         try:
-            # Vorabprüfung: wieviele neue Artikel stünden an?
             try:
                 count, low, high = await self._pool.group_info(name)
             except Exception as exc:
@@ -235,38 +246,59 @@ class MainWindow(QMainWindow):
                 self._statusbar.showMessage(f"Sync {name}: {exc}", 5000)
                 return
 
-            row = self._cache.get_group(name)
-            last_seen = row.last_seen if row else 0
-            gap = max(0, high - max(low, last_seen + 1) + 1)
-            if gap > SYNC_WARN_THRESHOLD:
-                est_min = gap / 200_000  # konservativ: ~200k Header/min
-                est_mb = gap * 0.7 / 1024  # ~700 B/Header in DB
-                ok = await confirm_async(
-                    self,
-                    f"Großer Sync: {name}",
-                    f"Diese Gruppe hat {gap:,} ungesyncte Artikel.\n\n"
-                    f"Geschätzt: ~{est_min:,.0f} Min Sync-Zeit, "
-                    f"~{est_mb:,.0f} MB Cache-Wachstum.\n\n"
-                    "Trotzdem syncen?",
-                )
-                if not ok:
-                    self._statusbar.showMessage("Sync abgebrochen", 3000)
-                    return
+            if cancel.is_set():
+                return
+
+            last_seen = await asyncio.to_thread(self._cache.get_last_seen, name)
+
+            plan = await SyncDialog.show_for(
+                self, name,
+                low=low, high=high, count=count, last_seen=last_seen,
+            )
+            if plan is None or cancel.is_set():
+                self._statusbar.showMessage("Sync abgebrochen", 3000)
+                return
 
             self._statusbar.showMessage(f"Sync läuft: {name} …")
+            progress = self._make_sync_progress(name)
             try:
-                n = await nntp_client.sync_group(self._pool, self._cache, name)
+                n = await nntp_client.sync_group(
+                    self._pool, self._cache, name,
+                    plan=plan, cancel=cancel, progress=progress,
+                )
             except Exception as exc:
                 log.exception("Sync %s fehlgeschlagen", name)
                 self._statusbar.showMessage(f"Sync {name} fehlgeschlagen: {exc}", 5000)
                 return
-            self._statusbar.showMessage(f"Sync {name}: {n} neue Artikel", 5000)
+
+            if cancel.is_set():
+                self._statusbar.showMessage(
+                    f"Sync {name} abgebrochen ({n:,} neue Artikel)", 5000
+                )
+            else:
+                self._statusbar.showMessage(f"Sync {name}: {n:,} neue Artikel", 5000)
             self._group_panel.refresh()
             if self._header_view.model().current_group() == name:
                 self._header_view.refresh_current()
         finally:
-            self._syncing.discard(name)
+            self._syncing.pop(name, None)
             self._group_panel.set_sync_running(name, False)
+
+    def _make_sync_progress(self, name: str):
+        """Throttled Progress-Callback: höchstens alle 500 ms ein Statusbar-Update."""
+        last = [0.0]
+
+        def cb(cur: int, total: int, inserted: int) -> None:
+            now = time.monotonic()
+            if now - last[0] < 0.5:
+                return
+            last[0] = now
+            pct = 100.0 * cur / total if total else 100.0
+            self._statusbar.showMessage(
+                f"Sync {name}: bei #{cur:,} von #{total:,} ({pct:.1f}%) – {inserted:,} neu"
+            )
+
+        return cb
 
     def _on_save_nzb(self, articles: list) -> None:
         if not articles:

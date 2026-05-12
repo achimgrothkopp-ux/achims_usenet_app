@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import email.utils
 import logging
 import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator, Iterable
+from datetime import datetime, timedelta, timezone
+from typing import AsyncIterator, Iterable, Literal
 
 from nntp import NNTPClient, NNTPError
 from nntp.types import Newsgroup, SSLMode
@@ -192,39 +194,189 @@ class NNTPPool:
 
 BATCH_SIZE = 10_000
 
+SyncMode = Literal["incremental", "last_n", "since_date", "full"]
+
+
+@dataclass(frozen=True)
+class SyncPlan:
+    """Beschreibt, *was* ein sync_group()-Lauf tun soll.
+
+    - incremental: ab last_seen+1 bis high
+    - last_n:      die letzten N Article-Nummern (max(low, high-N+1, last_seen+1) bis high)
+    - since_date:  ab Datum, gefunden per find_article_at_date()
+    - full:        Cache leeren, ab low syncen
+
+    `max_articles` deckelt zusätzlich jeden Lauf: nach so vielen Article-Numbers ist
+    Schluss, der Rest geht beim nächsten Sync (last_seen wird pro Chunk persistiert).
+    """
+
+    mode: SyncMode = "incremental"
+    last_n: int | None = None
+    since: datetime | None = None
+    max_articles: int | None = None
+
+    @classmethod
+    def incremental(cls, *, max_articles: int | None = None) -> "SyncPlan":
+        return cls(mode="incremental", max_articles=max_articles)
+
+    @classmethod
+    def last_n_articles(cls, n: int, *, max_articles: int | None = None) -> "SyncPlan":
+        return cls(mode="last_n", last_n=int(n), max_articles=max_articles)
+
+    @classmethod
+    def since_date(cls, dt: datetime, *, max_articles: int | None = None) -> "SyncPlan":
+        return cls(mode="since_date", since=dt, max_articles=max_articles)
+
+    @classmethod
+    def full(cls, *, max_articles: int | None = None) -> "SyncPlan":
+        return cls(mode="full", max_articles=max_articles)
+
+
+def _parse_nntp_date(s: str) -> datetime | None:
+    """RFC-2822-Datum aus dem Date-Header → tz-aware datetime, oder None."""
+    if not s:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def find_article_at_date(
+    pool: "NNTPPool",
+    group: str,
+    target: datetime,
+    *,
+    low: int | None = None,
+    high: int | None = None,
+) -> int:
+    """Binary Search nach der ersten Article-Number mit Date >= target.
+
+    Rückgabe liegt in [low, high+1]. high+1 bedeutet: das Zieldatum liegt
+    hinter dem neuesten verfügbaren Artikel, also nichts zu syncen.
+
+    Lücken (Article-Nummern ohne Header) werden überbrückt, indem statt
+    eines Punkt-Reads ein kleines Fenster gelesen wird; das erste
+    parsbare Datum darin entscheidet den Bisection-Schritt.
+    """
+    if low is None or high is None:
+        _, low2, high2 = await pool.group_info(group)
+        if low is None:
+            low = low2
+        if high is None:
+            high = high2
+    if low > high:
+        return high + 1
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+
+    async def first_parsable(num: int, window: int = 100) -> tuple[int, datetime] | None:
+        end = min(num + window, high)
+        rows = await pool.fetch_headers(group, num, end)
+        for r in rows:
+            dt = _parse_nntp_date(r.date)
+            if dt is not None:
+                return r.number, dt
+        return None
+
+    lo, hi = low, high
+    # log2(1M) ≈ 20, Limit großzügig wegen Lücken-Bypass.
+    for _ in range(50):
+        if lo >= hi:
+            break
+        mid = (lo + hi) // 2
+        result = await first_parsable(mid)
+        if result is None:
+            # Fenster ab mid liefert nichts → linke Hälfte einschränken
+            hi = mid
+            continue
+        num, dt = result
+        if dt < target:
+            lo = num + 1
+        else:
+            hi = num
+
+    end_check = await first_parsable(lo)
+    if end_check is None or end_check[1] < target:
+        return high + 1
+    return end_check[0]
+
 
 async def sync_group(
     pool: NNTPPool,
     cache: header_cache.HeaderCache,
     group: str,
     *,
-    full: bool = False,
+    plan: SyncPlan | None = None,
     progress: callable | None = None,
+    cancel: asyncio.Event | None = None,
 ) -> int:
-    """Inkrementeller Header-Sync. Liefert Anzahl neu eingefügter Artikel."""
-    count, low, high = await pool.group_info(group)
-    log.info("GROUP %s: count=%s low=%s high=%s", group, count, low, high)
+    """Header-Sync nach Plan. Liefert Anzahl neu eingefügter Artikel.
 
-    if full:
-        log.info("Voller Resync angefordert → Cache für %s wird geleert", group)
+    Ist `cancel` gesetzt, prüft die Schleife zwischen Chunks und kehrt
+    sauber zurück; bereits eingefügte Chunks bleiben persistent
+    (last_seen wird pro Chunk geschrieben).
+    """
+    if plan is None:
+        plan = SyncPlan()
+
+    count, low, high = await pool.group_info(group)
+    log.info("GROUP %s: count=%s low=%s high=%s mode=%s", group, count, low, high, plan.mode)
+
+    if plan.mode == "full":
+        log.info("Vollsync angefordert → Cache für %s wird geleert", group)
         await asyncio.to_thread(cache.clear_group, group)
         last_seen = 0
     else:
         last_seen = await asyncio.to_thread(cache.get_last_seen, group)
-    start = max(low, last_seen + 1)
+
+    if plan.mode == "incremental":
+        start = max(low, last_seen + 1)
+    elif plan.mode == "last_n":
+        if not plan.last_n or plan.last_n < 1:
+            raise ValueError("plan.last_n muss eine positive Anzahl sein")
+        start = max(low, high - plan.last_n + 1, last_seen + 1)
+    elif plan.mode == "since_date":
+        if plan.since is None:
+            raise ValueError("plan.since muss ein Datum sein")
+        # Schon up-to-date → Bisection überspringen (spart bis 20 Roundtrips)
+        if last_seen >= high:
+            start = high + 1
+        else:
+            date_start = await find_article_at_date(pool, group, plan.since, low=low, high=high)
+            start = max(low, date_start, last_seen + 1)
+    elif plan.mode == "full":
+        start = low
+    else:
+        raise ValueError(f"Unbekannter sync mode: {plan.mode!r}")
+
     if start > high:
-        log.info("Gruppe %s ist aktuell (last_seen=%s, high=%s)", group, last_seen, high)
+        log.info("Gruppe %s: nichts zu syncen (start=%s, high=%s)", group, start, high)
         await asyncio.to_thread(cache.upsert_group, group, low, high, last_seen, None)
         return 0
+
+    end_limit = high
+    if plan.max_articles is not None and plan.max_articles > 0:
+        end_limit = min(high, start + plan.max_articles - 1)
 
     await asyncio.to_thread(cache.upsert_group, group, low, high, last_seen, None)
 
     inserted_total = 0
     chunk_start = start
     t0 = time.monotonic()
+    aborted = False
 
-    while chunk_start <= high:
-        chunk_end = min(chunk_start + BATCH_SIZE - 1, high)
+    while chunk_start <= end_limit:
+        if cancel is not None and cancel.is_set():
+            log.info("Sync %s abgebrochen bei #%s", group, chunk_start)
+            aborted = True
+            break
+        chunk_end = min(chunk_start + BATCH_SIZE - 1, end_limit)
         log.info("xover %s [%s..%s]", group, chunk_start, chunk_end)
         rows = await pool.fetch_headers(group, chunk_start, chunk_end)
         if rows:
@@ -236,14 +388,15 @@ async def sync_group(
             await asyncio.to_thread(cache.set_last_seen, group, chunk_end)
 
         if progress is not None:
-            progress(chunk_end, high, inserted_total)
+            progress(chunk_end, end_limit, inserted_total)
 
         chunk_start = chunk_end + 1
 
     dt = time.monotonic() - t0
     log.info(
-        "Sync %s fertig: %s neue Artikel in %.1fs (%.0f/s)",
+        "Sync %s %s: %s neue Artikel in %.1fs (%.0f/s)",
         group,
+        "abgebrochen" if aborted else "fertig",
         inserted_total,
         dt,
         inserted_total / dt if dt > 0 else 0.0,
@@ -261,7 +414,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("sync", help="Header-Sync für eine Gruppe")
     sp.add_argument("group", help="z.B. de.alt.test")
-    sp.add_argument("--full", action="store_true", help="Komplett-Sync (ignoriert last_seen)")
+    mode = sp.add_mutually_exclusive_group()
+    mode.add_argument("--full", action="store_true", help="Vollsync: Cache leeren, ab low syncen")
+    mode.add_argument("--last-n", type=int, metavar="N", help="Nur die letzten N Article-Nummern syncen")
+    mode.add_argument("--since", metavar="YYYY-MM-DD", help="Ab Datum syncen (Bisection)")
+    sp.add_argument("--max-articles", type=int, metavar="N", help="Pro-Sync-Cap: höchstens N Article-Numbers")
 
     sp = sub.add_parser("search", help="FTS5-Suche im Cache")
     sp.add_argument("query")
@@ -295,7 +452,17 @@ async def _amain(args: argparse.Namespace) -> int:
                 pct = 100.0 * cur / total if total else 100.0
                 print(f"  {args.group}: {cur}/{total} ({pct:5.1f}%)  insgesamt neu: {inserted}", flush=True)
 
-            n = await sync_group(pool, cache, args.group, full=args.full, progress=_show)
+            if args.full:
+                plan = SyncPlan.full(max_articles=args.max_articles)
+            elif args.last_n is not None:
+                plan = SyncPlan.last_n_articles(args.last_n, max_articles=args.max_articles)
+            elif args.since:
+                since = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+                plan = SyncPlan.since_date(since, max_articles=args.max_articles)
+            else:
+                plan = SyncPlan.incremental(max_articles=args.max_articles)
+
+            n = await sync_group(pool, cache, args.group, plan=plan, progress=_show)
             print(f"Fertig. Neu eingefügt: {n}")
 
         elif args.cmd == "subscribe":

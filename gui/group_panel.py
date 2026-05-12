@@ -26,6 +26,7 @@ SUBSCRIBE_WARN_THRESHOLD = 1_000_000
 class GroupPanel(QWidget):
     group_selected = Signal(str)
     sync_requested = Signal(str)
+    cancel_requested = Signal(str)
 
     def __init__(
         self,
@@ -53,7 +54,7 @@ class GroupPanel(QWidget):
         self._btn_subscribe.clicked.connect(self._on_subscribe_clicked)
         self._btn_unsubscribe = QPushButton("Abbestellen", self)
         self._btn_unsubscribe.clicked.connect(self._on_unsubscribe_clicked)
-        self._btn_sync = QPushButton("Sync", self)
+        self._btn_sync = QPushButton("Sync…", self)
         self._btn_sync.clicked.connect(self._on_sync_clicked)
         btn_row.addWidget(self._btn_subscribe)
         btn_row.addWidget(self._btn_unsubscribe)
@@ -93,7 +94,13 @@ class GroupPanel(QWidget):
     def _update_buttons(self) -> None:
         cur = self.current_group()
         running = cur is not None and cur in self._syncing
-        self._btn_sync.setEnabled(cur is not None and not running)
+        self._btn_sync.setEnabled(cur is not None)
+        self._btn_sync.setText("Stop" if running else "Sync…")
+        self._btn_sync.setToolTip(
+            "Laufenden Sync abbrechen (Fortschritt bleibt erhalten)"
+            if running
+            else "Sync-Dialog öffnen"
+        )
         self._btn_unsubscribe.setEnabled(cur is not None and not running)
 
     def _on_selection(self) -> None:
@@ -165,6 +172,9 @@ class GroupPanel(QWidget):
 
     def _on_sync_clicked(self) -> None:
         name = self.current_group()
-        if not name or name in self._syncing:
+        if not name:
             return
-        self.sync_requested.emit(name)
+        if name in self._syncing:
+            self.cancel_requested.emit(name)
+        else:
+            self.sync_requested.emit(name)
