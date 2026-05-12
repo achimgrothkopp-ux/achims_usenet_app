@@ -332,6 +332,35 @@ class HeaderCache:
             for r in rows
         ]
 
+    def search_articles(
+        self, query: str, *, group: str | None = None, limit: int = 50
+    ) -> list[ArticleRow]:
+        """FTS-Suche, die direkt komplette ArticleRows liefert (ein JOIN statt N Selects).
+
+        FTS5 MATCH muss auf den unaliassed Tabellennamen — Alias `f` wird
+        von SQLite nicht akzeptiert ('no such column: f').
+        """
+        params: list = [query]
+        sql = (
+            "SELECT articles.group_name, articles.number, articles.message_id, "
+            "       articles.subject, articles.from_addr, articles.date, "
+            "       articles.bytes, articles.lines "
+            "FROM articles_fts "
+            "JOIN articles "
+            "  ON articles.group_name = articles_fts.group_name "
+            " AND articles.number     = articles_fts.number "
+            "WHERE articles_fts MATCH ?"
+        )
+        if group:
+            sql += " AND articles_fts.group_name = ?"
+            params.append(group)
+        sql += " ORDER BY articles_fts.rank LIMIT ?"
+        params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._article_row(r) for r in rows]
+
     @staticmethod
     def _article_row(r: sqlite3.Row) -> ArticleRow:
         return ArticleRow(

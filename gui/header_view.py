@@ -65,19 +65,11 @@ class HeaderModel(QAbstractTableModel):
     def set_search(self, group: str | None, query: str) -> None:
         self.beginResetModel()
         self._mode = _Mode(kind="search", group=group, query=query)
-        self._rows = []
-        self._total = 0
         try:
-            hits = self._cache.search(query, group=group, limit=_SEARCH_LIMIT)
+            rows = self._cache.search_articles(query, group=group, limit=_SEARCH_LIMIT)
         except Exception as exc:
             log.warning("FTS-Query fehlgeschlagen: %s", exc)
-            hits = []
-
-        rows: list[header_cache.ArticleRow] = []
-        for hit in hits:
-            row = self._cache.get_article(hit.group, hit.number)
-            if row is not None:
-                rows.append(row)
+            rows = []
         self._rows = rows
         self._total = len(rows)
         self.endResetModel()
