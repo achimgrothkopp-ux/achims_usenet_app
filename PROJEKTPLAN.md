@@ -140,13 +140,52 @@ NZBs übergeben, Queue live anzeigen.
 - Verbindungs-Health-Indicator in Statusbar (grün/rot)
 - **Akzeptanz:** Klick "→ SABnzbd" → Job in Queue-Panel, läuft, Datei landet im SAB-Folder.
 
-### Phase 6 – Politur  *(1–2 Tage)*
+### Phase 6 – Politur  *(1–2 Tage)*  ✅
 
 - Settings-Dialog (NNTP-Server, SAB-URL+Key, Connection-Anzahl)
 - Persistierung von Spaltenbreiten/Splitter-Positionen
 - Keyboard-Shortcuts (J/K next/prev, Space markieren)
 - Desktop-Datei für Anwendungsmenü
 - README mit Setup-Anleitung
+
+### Phase 6+ – Großgruppen-Handling  *(Nachträge nach realem Betrieb)*  ✅
+
+Reale Nutzung gegen Mio-Gruppen hat eine Reihe von Kanten freigelegt –
+hier zusammengefasst, weil zusammenhängend.
+
+- **Async-Dialoge** (a740eb8): warn_later/info_later/critical_later
+  via QTimer.singleShot, confirm_async non-modal via Future. Vermeidet
+  „Cannot enter into task X while task Y is being executed", wenn ein
+  modaler QMessageBox aus einem qasync-Task aufgerufen wird.
+- **Sync-Lock** synchron schon im _on_sync_requested, sonst gewinnt ein
+  Doppelklick das Rennen vor dem Task-Schedule.
+- **`clear_group`** ohne Trigger pro Zeile – AFTER-DELETE auf articles
+  würde bei 1.7M Zeilen 8+ Min im FTS-Index suchen; Bulk-Delete mit
+  temporär gedropptem Trigger ist in 35 s durch.
+- **SyncPlan** mit vier Modi (inkrementell / letzte N / seit Datum /
+  Vollsync) und Pro-Lauf-Cap `max_articles`. Sync-Dialog mit Statistik
+  und Schätzung beim Auswählen.
+- **`find_article_at_date`** – Binary Search über `OVER`-Roundtrips
+  mit 100er-Fenster (überbrückt Lücken in Article-Nummern). Erlaubt
+  „Seit YYYY-MM-DD" als Sync-Startpunkt.
+- **Abbrechbarer Sync** über `asyncio.Event`. Cancel stoppt nur das
+  Ziehen neuer Chunks; laufende Fetches werden zu Ende persistiert.
+  Pro-Chunk-Persistenz + monotones Präfix-Tracking garantieren, dass
+  `last_seen` lückenfrei bleibt und Resume nahtlos weitermacht.
+- **Parallel-Fetch** via `SyncPlan.parallel`. Eine asyncio.Queue
+  verteilt Chunk-Indizes an N Worker, die parallel XOVER fahren;
+  Inserts in SQLite sind hinter `state_lock` serialisiert. Live
+  gemessen: 1,7× Speedup bei parallel=4 vs 1.
+- **`articles.date_unix`** + Index + Backfill-Migration. NNTP-Date
+  wird beim Insert in Unix-Sekunden geparst (`-1` = versucht-aber-
+  ungültig, `0` = leerer Header). Header-Tabelle sortiert die
+  Datums-Spalte jetzt chronologisch statt lexikografisch.
+- **FTS-Suche per JOIN** – `search_articles()` liefert komplette
+  ArticleRows in einem Query, statt N+1 Lookups nach jedem `SearchHit`.
+- **pynntp-Workaround**: `LIST ACTIVE` wird von pynntp als
+  `(name, low, high, status)` geparst, obwohl RFC 3977 §7.6.2.2
+  `name high low status` liefert. Wir tauschen low/high in
+  `NNTPPool.list_active` zurück, damit überall `low <= high` gilt.
 
 ### Phase 7 – Newznab-Indexer  *(optional, später)*
 
@@ -156,17 +195,28 @@ Sobald ein Indexer-Account existiert. Additiv – greift nicht in Phase 1–6 ei
 - `search_view.py`: separater Tab/Panel für Indexer-Suche
 - Direkt-Übergabe an SABnzbd
 
-### Phase 8 – Group-Browser  *(geplant)*
+### Phase 8 – Group-Browser  ✅
 
-Beim Klick auf "Abonnieren…" muss man aktuell den Gruppennamen exakt
-kennen. Stattdessen:
+Beim Klick auf "Abonnieren…" musste man bisher den Gruppennamen exakt
+kennen. Realisiert (98b0068):
 
-- LIST ACTIVE einmal pro Session ziehen (Newshosting liefert ~100k
-  Gruppen, ~5–10 MB) und im Cache (`groups`-Tabelle) ablegen
-- `gui/group_browser.py`: QTreeView nach Hierarchie
-  (`alt.binaries.*`, `de.alt.*` etc.) plus Filter-Suche
-- Mehrfach-Subscribe in einem Schritt
-- Spalten: Name, Artikel-Anzahl, ggf. Status
+- LIST ACTIVE per "Aktualisieren"-Button ziehbar (Newshosting liefert
+  ~111k Gruppen in ~1,3 s, ~0,3 s Bulk-Insert) und in der
+  `groups`-Tabelle persistiert. `upsert_groups_bulk` schont `subscribed`
+  und `last_article_seen` – ein Refresh überschreibt also keinen Abo-
+  Stand.
+- `gui/group_browser.py`: flacher QTableView statt TreeView – bei 100k
+  Gruppen ist Filter auf Name praktischer als Hierarchie-Navigation,
+  und alphabetische Sortierung clustert `alt.binaries.*` / `de.alt.*`
+  ohnehin zusammen.
+- Spalten: Name, ≈ Artikel (high−low+1), Status, Abonniert. Eigene
+  Sort-Role liefert numerische Werte für die Artikel-Spalte.
+- Multi-Select (ExtendedSelection) + Buttons "Markierte abonnieren" /
+  "Abbestellen". `subscribed_changed`-Signal triggert Refresh des
+  linken GroupPanel.
+- `QSortFilterProxyModel` mit case-insensitive Substring-Filter auf
+  der Name-Spalte; "Nur Abonnierte zeigen"-Checkbox reduziert den
+  Source-Bestand.
 
 ---
 
