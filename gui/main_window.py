@@ -150,7 +150,7 @@ class MainWindow(QMainWindow):
         self._group_panel.group_selected.connect(self._on_group_selected)
         self._group_panel.sync_requested.connect(self._on_sync_requested)
         self._group_panel.cancel_requested.connect(self._on_cancel_requested)
-        self._header_view.article_activated.connect(self._article_view.show_article)
+        self._header_view.release_activated.connect(self._article_view.show_release)
         self._header_view.save_nzb_requested.connect(self._on_save_nzb)
         self._header_view.submit_sab_requested.connect(self._on_submit_sab)
 

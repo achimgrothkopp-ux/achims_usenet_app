@@ -234,7 +234,7 @@ def _fmt_segments(r: ReleaseRow) -> str:
 
 
 class HeaderView(QWidget):
-    article_activated = Signal(object)  # ArticleRow (erstes Segment des Releases)
+    release_activated = Signal(object)  # ReleaseRow
     save_nzb_requested = Signal(list)   # list[ArticleRow]
     submit_sab_requested = Signal(list)  # list[ArticleRow]
 
@@ -335,11 +335,11 @@ class HeaderView(QWidget):
         idx = proxy.index(target, _COL_SUBJECT)
         self._table.setCurrentIndex(idx)
         self._table.scrollTo(idx)
-        # Body laden: erstes Segment des Release-Eintrags.
+        # Body laden: ganzes Release an die ArticleView.
         src = proxy.mapToSource(idx)
         release = self._model.release_at(src.row())
         if release and release.articles:
-            self.article_activated.emit(release.articles[0])
+            self.release_activated.emit(release)
 
     def toggle_mark_current(self) -> None:
         proxy = self._table.model()
@@ -401,7 +401,7 @@ class HeaderView(QWidget):
             return
         release = self._model.release_at(src_index.row())
         if release and release.articles:
-            self.article_activated.emit(release.articles[0])
+            self.release_activated.emit(release)
 
     def _on_save_nzb(self) -> None:
         marked = self._model.marked_articles()

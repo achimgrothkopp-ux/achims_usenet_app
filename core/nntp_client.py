@@ -22,6 +22,41 @@ from core.logging_setup import configure as configure_logging
 log = logging.getLogger(__name__)
 
 
+def _patch_pynntp_dot_unstuffing() -> None:
+    """Workaround für pynntp 2.0.1: `_info_plain` liefert dot-stuffed Lines doppelt.
+
+    Original (nntp/nntp.py:300-305) yieldet bei einer mit `.` beginnenden
+    Zeile sowohl `line[1:]` (entstuffed) als auch `line` (roh) – das `else`
+    fehlt. Das verdoppelt zufällige Bytes mitten im yEnc-Stream und macht
+    Binär-Decodes (Bilder, Archive) korrupt. Wir patchen die Methode auf
+    der Klasse, bevor irgendeine Connection geöffnet wird. Sobald pynntp
+    den Fix upstream zieht, kann dieser Patch raus.
+    """
+    from nntp.nntp import NNTPClient as _PNC
+
+    if getattr(_PNC, "_info_plain_patched", False):
+        return
+
+    def _info_plain(self):
+        self._generating = True
+        try:
+            for line in self._line():
+                if line == b".\r\n":
+                    break
+                if line.startswith(b"."):
+                    yield line[1:]
+                else:
+                    yield line
+        finally:
+            self._generating = False
+
+    _PNC._info_plain = _info_plain  # type: ignore[assignment]
+    _PNC._info_plain_patched = True  # type: ignore[attr-defined]
+
+
+_patch_pynntp_dot_unstuffing()
+
+
 @dataclass(frozen=True)
 class HeaderRow:
     number: int
@@ -194,10 +229,18 @@ class NNTPPool:
             return await asyncio.to_thread(_run)
 
     async def article(self, message_id: str) -> tuple[dict, bytes]:
-        """ARTICLE per Message-ID → (Header-Dict, Body-Bytes)."""
+        """ARTICLE per Message-ID → (Header-Dict, Roh-Body-Bytes).
+
+        `decode=False` ist entscheidend: pynntp würde yEnc sonst implizit
+        dekodieren, sobald 'yEnc' im Subject steht, und uns nur die rohen
+        Datei-Bytes liefern – ohne Filename, ohne Frame-Info. Für unsere
+        Bild-Vorschau (sabyenc3) und für korrektes Multi-Part-Merging
+        brauchen wir die unveränderten yEnc-Frames. Der Dot-Stuffing-Fix
+        weiter oben sorgt dafür, dass die Bytes hier sauber ankommen.
+        """
         async with self.acquire() as c:
             def _run() -> tuple[dict, bytes]:
-                _num, hd, body = c.article(message_id)
+                _num, hd, body = c.article(message_id, decode=False)
                 return dict(hd), body
             return await asyncio.to_thread(_run)
 

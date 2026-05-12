@@ -13,3 +13,7 @@ lxml>=5.2
 
 # TOML schreiben (tomllib in stdlib ist nur read-only)
 tomli-w>=1.0
+
+# yEnc-Decoder (C-Extension, von SABnzbd-Entwicklern). Für Bild-Vorschau
+# in der ArticleView – dekodiert Single- und Multi-Part-yEnc.
+sabyenc3>=5.4
