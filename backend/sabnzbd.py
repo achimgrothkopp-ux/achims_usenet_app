@@ -5,8 +5,11 @@ Alle Calls verwenden ?output=json. Authentifizierung via apikey-Param.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 
@@ -62,6 +65,72 @@ class SABnzbdClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    # ---- Auto-Start ------------------------------------------------------
+
+    async def is_reachable(self, *, timeout: float = 1.0) -> bool:
+        """TCP-Probe auf den konfigurierten SAB-Host. Schnell und ohne API-Key."""
+        if not self._base:
+            return False
+        u = urlparse(self._base)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or (443 if u.scheme == "https" else 80)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
+        except (TimeoutError, asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            return False
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (OSError, ConnectionResetError):
+            pass
+        return True
+
+    async def ensure_running(
+        self,
+        *,
+        bin_path: str = "sabnzbdplus",
+        startup_timeout: float = 20.0,
+    ) -> bool:
+        """Startet sabnzbdplus als detachten Hintergrundprozess, falls nicht erreichbar.
+
+        Idempotent: läuft SAB schon, no-op. Liefert True wenn SAB nach der
+        Aktion antwortet, False wenn Binary fehlt oder Startup-Timeout reißt.
+        SAB läuft bewusst weiter, wenn die App schließt — Downloads sollen
+        im Hintergrund weiterlaufen.
+        """
+        if await self.is_reachable():
+            return True
+
+        log.info("SAB nicht erreichbar – starte %s --daemon", bin_path)
+        try:
+            # --daemon lässt SAB sich selbst doppel-forken, der ursprüngliche
+            # Prozess exitet sofort. Wir wait()en darauf, damit asyncio den
+            # Zombie reapen kann; der echte SAB-Daemon lebt unter neuer PID
+            # weiter, auch wenn diese App schließt.
+            proc = await asyncio.create_subprocess_exec(
+                bin_path,
+                "--daemon",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            await proc.wait()
+        except FileNotFoundError:
+            log.warning("SAB-Binary nicht gefunden: %s (in PATH?)", bin_path)
+            return False
+
+        deadline = time.monotonic() + startup_timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            if await self.is_reachable():
+                log.info("SAB ist hochgefahren")
+                return True
+        log.warning("SAB nach %.0fs nicht erreichbar", startup_timeout)
+        return False
 
     # ---- Low-Level ------------------------------------------------------
 

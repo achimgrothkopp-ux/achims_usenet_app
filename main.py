@@ -40,7 +40,14 @@ def main() -> None:
     app_close_event = asyncio.Event()
     app.aboutToQuit.connect(app_close_event.set)
 
+    async def _ensure_sab() -> None:
+        if sab.configured:
+            await sab.ensure_running()
+
     async def _wait_and_cleanup() -> None:
+        # SAB-Start läuft parallel zur GUI – Health-Indicator pickt's
+        # automatisch auf, sobald die JSON-API antwortet.
+        asyncio.ensure_future(_ensure_sab())
         await app_close_event.wait()
         window.shutdown()
 
