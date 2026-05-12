@@ -424,12 +424,18 @@ class HeaderCache:
         limit: int = 500,
         order: str = "desc",
     ) -> list[ArticleRow]:
+        """Articles seitenweise abrufen. `limit <= 0` heißt 'alle ab offset'."""
         order_sql = "DESC" if order.lower() == "desc" else "ASC"
+        if limit is None or int(limit) <= 0:
+            # SQLite: LIMIT -1 = unbegrenzt; mit OFFSET kombinierbar.
+            limit_sql = -1
+        else:
+            limit_sql = int(limit)
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines, date_unix "
                 f"FROM articles WHERE group_name = ? ORDER BY number {order_sql} LIMIT ? OFFSET ?",
-                (group, int(limit), int(offset)),
+                (group, limit_sql, int(offset)),
             ).fetchall()
         return [self._article_row(r) for r in rows]
 

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Usenet-App
+Name=Achims Usenet-App
 GenericName=Newsreader
 Comment=Usenet-Reader mit NZB-Builder und SABnzbd-Anbindung
 Exec=/home/achim/Entwicklung/usenet/.venv/bin/python /home/achim/Entwicklung/usenet/main.py

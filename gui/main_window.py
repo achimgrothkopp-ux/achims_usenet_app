@@ -61,7 +61,7 @@ class MainWindow(QMainWindow):
         # Pro laufendem Sync ein Cancel-Event; Stop-Button setzt das Event,
         # die sync_group-Schleife checkt es zwischen Chunks.
         self._syncing: dict[str, asyncio.Event] = {}
-        self.setWindowTitle("Usenet-App")
+        self.setWindowTitle("Achims Usenet-App")
         self.resize(1280, 860)
 
         self._build_menubar()

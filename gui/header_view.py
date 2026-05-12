@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -23,19 +24,17 @@ from PySide6.QtWidgets import (
 )
 
 from core import header_cache
+from core.release_grouper import ReleaseRow, group_releases
 
 log = logging.getLogger(__name__)
 
-_PAGE_SIZE = 500
-_SEARCH_LIMIT = 1000
+_SEARCH_LIMIT = 5000
 
-_COL_CHECK, _COL_NUMBER, _COL_SUBJECT, _COL_FROM, _COL_DATE, _COL_BYTES = range(6)
-_COLUMNS = ("✓", "Nr.", "Subject", "From", "Datum", "Bytes")
+_COL_CHECK, _COL_SUBJECT, _COL_FROM, _COL_DATE, _COL_SEGS, _COL_BYTES = range(6)
+_COLUMNS = ("✓", "Subject", "From", "Datum", "Segmente", "Bytes")
 
-# Eigene Sort-Rolle, damit das Datum nach Unix-Timestamp (int) sortiert
-# wird statt nach RFC-2822-String. Andere Spalten liefern hier ebenfalls
-# einen typisierten Wert, sodass auch "Bytes" und "Nr." sauber numerisch
-# sortieren.
+# Eigene Sort-Rolle, damit Datum/Bytes/Segmente numerisch sortieren statt
+# lexikalisch auf der Display-String-Variante.
 _SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
@@ -53,82 +52,52 @@ class HeaderModel(QAbstractTableModel):
         super().__init__(parent)
         self._cache = cache
         self._mode: _Mode = _Mode(kind="browse", group=None)
-        self._rows: list[header_cache.ArticleRow] = []
-        self._total = 0
-        # Markierungen überleben Mode-Wechsel: Schlüssel (group, number).
-        self._marks: set[tuple[str, int]] = set()
+        self._releases: list[ReleaseRow] = []
+        # Markierungen überleben Mode-Wechsel. Schlüssel: (group, release_key).
+        self._marks: set[tuple[str, str]] = set()
 
     # ---- Mode-Switching --------------------------------------------------
 
     def set_group(self, group: str | None) -> None:
         self.beginResetModel()
         self._mode = _Mode(kind="browse", group=group)
-        self._rows = []
-        self._total = self._cache.article_count(group) if group else 0
+        if group:
+            articles = self._cache.fetch_articles(group, limit=0, order="desc")
+            self._releases = group_releases(articles)
+        else:
+            self._releases = []
         self.endResetModel()
-        self._fill_initial()
 
     def set_search(self, group: str | None, query: str) -> None:
         self.beginResetModel()
         self._mode = _Mode(kind="search", group=group, query=query)
         try:
-            rows = self._cache.search_articles(query, group=group, limit=_SEARCH_LIMIT)
+            articles = self._cache.search_articles(
+                query, group=group, limit=_SEARCH_LIMIT
+            )
         except Exception as exc:
             log.warning("FTS-Query fehlgeschlagen: %s", exc)
-            rows = []
-        self._rows = rows
-        self._total = len(rows)
+            articles = []
+        self._releases = group_releases(articles)
         self.endResetModel()
 
     def current_group(self) -> str | None:
         return self._mode.group
 
-    # ---- Lazy-Fetch (browse-Modus) --------------------------------------
-
-    def _fill_initial(self) -> None:
-        if self._mode.kind != "browse" or not self._mode.group or self._total == 0:
-            return
-        page = self._cache.fetch_articles(
-            self._mode.group, offset=0, limit=_PAGE_SIZE, order="desc"
-        )
-        if not page:
-            return
-        self.beginInsertRows(QModelIndex(), 0, len(page) - 1)
-        self._rows = page
-        self.endInsertRows()
-
-    def canFetchMore(self, parent: QModelIndex) -> bool:
-        if parent.isValid() or self._mode.kind != "browse":
-            return False
-        return len(self._rows) < self._total
-
-    def fetchMore(self, parent: QModelIndex) -> None:
-        if parent.isValid() or self._mode.kind != "browse" or not self._mode.group:
-            return
-        offset = len(self._rows)
-        page = self._cache.fetch_articles(
-            self._mode.group, offset=offset, limit=_PAGE_SIZE, order="desc"
-        )
-        if not page:
-            return
-        self.beginInsertRows(QModelIndex(), offset, offset + len(page) - 1)
-        self._rows.extend(page)
-        self.endInsertRows()
-
     # ---- Markierungen ---------------------------------------------------
 
     def marked_articles(self) -> list[header_cache.ArticleRow]:
-        """Alle markierten Artikel aus dem Cache holen, in stabiler Reihenfolge.
+        """Alle Artikel der markierten Releases einsammeln.
 
-        Wir arbeiten direkt mit dem Cache statt mit den geladenen
-        Pagen, weil Markierungen Mode-übergreifend gehalten werden und
-        Rows in der UI evtl. noch gar nicht materialisiert sind.
+        Reihenfolge: Release-Reihenfolge (DESC im Cache → neueste zuerst),
+        innerhalb eines Releases die Artikel-Reihenfolge aus dem Grouper.
+        Der NZB-Builder ordnet anschließend nochmal nach Subject-Stamm
+        und Part-Nummer.
         """
         out: list[header_cache.ArticleRow] = []
-        for group, number in sorted(self._marks):
-            row = self._cache.get_article(group, number)
-            if row is not None:
-                out.append(row)
+        for r in self._releases:
+            if r.articles and self._mark_key(r) in self._marks:
+                out.extend(r.articles)
         return out
 
     def mark_count(self) -> int:
@@ -138,17 +107,16 @@ class HeaderModel(QAbstractTableModel):
         if not self._marks:
             return
         self._marks.clear()
-        # Alle sichtbaren Zeilen neu zeichnen (CheckStateRole)
-        if self._rows:
+        if self._releases:
             top = self.index(0, _COL_CHECK)
-            bottom = self.index(len(self._rows) - 1, _COL_CHECK)
+            bottom = self.index(len(self._releases) - 1, _COL_CHECK)
             self.dataChanged.emit(top, bottom, [Qt.ItemDataRole.CheckStateRole])
         self.marks_changed.emit(0)
 
     # ---- Standard-Model-API ---------------------------------------------
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self._rows)
+        return 0 if parent.isValid() else len(self._releases)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(_COLUMNS)
@@ -171,29 +139,34 @@ class HeaderModel(QAbstractTableModel):
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        row = self._rows[index.row()]
+        r = self._releases[index.row()]
         col = index.column()
+        mark_key = self._mark_key(r)
+
         if role == Qt.ItemDataRole.CheckStateRole and col == _COL_CHECK:
-            key = (row.group, row.number)
-            return Qt.CheckState.Checked if key in self._marks else Qt.CheckState.Unchecked
+            return Qt.CheckState.Checked if mark_key in self._marks else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == _COL_NUMBER: return row.number
-            if col == _COL_SUBJECT: return row.subject
-            if col == _COL_FROM: return row.from_addr
-            if col == _COL_DATE: return row.date
-            if col == _COL_BYTES: return _fmt_bytes(row.bytes)
+            if col == _COL_SUBJECT: return r.subject
+            if col == _COL_FROM: return r.poster
+            if col == _COL_DATE: return _fmt_date(r.date_unix)
+            if col == _COL_SEGS: return _fmt_segments(r)
+            if col == _COL_BYTES: return _fmt_bytes(r.total_bytes)
         elif role == _SORT_ROLE:
-            if col == _COL_NUMBER: return row.number
-            if col == _COL_SUBJECT: return row.subject
-            if col == _COL_FROM: return row.from_addr
-            if col == _COL_DATE: return row.date_unix
-            if col == _COL_BYTES: return row.bytes
+            if col == _COL_SUBJECT: return r.subject
+            if col == _COL_FROM: return r.poster
+            if col == _COL_DATE: return r.date_unix
+            if col == _COL_SEGS: return r.segments_have
+            if col == _COL_BYTES: return r.total_bytes
             if col == _COL_CHECK:
-                return 1 if (row.group, row.number) in self._marks else 0
+                return 1 if mark_key in self._marks else 0
         elif role == Qt.ItemDataRole.ToolTipRole:
-            return f"Message-ID: {row.message_id}\nLines: {row.lines}"
+            files = r.file_count or 1
+            return (
+                f"{files} Datei(en), {r.segments_have} Artikel\n"
+                f"Erstes Subject: {r.articles[0].subject if r.articles else ''}"
+            )
         elif role == Qt.ItemDataRole.UserRole:
-            return row
+            return r
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.ItemDataRole.EditRole) -> bool:
@@ -203,39 +176,65 @@ class HeaderModel(QAbstractTableModel):
             or index.column() != _COL_CHECK
         ):
             return False
-        row = self._rows[index.row()]
-        key = (row.group, row.number)
+        r = self._releases[index.row()]
+        mark_key = self._mark_key(r)
         # PySide reicht hier sowohl Qt.CheckState als auch int durch.
         checked = Qt.CheckState(value) == Qt.CheckState.Checked
         if checked:
-            self._marks.add(key)
+            self._marks.add(mark_key)
         else:
-            self._marks.discard(key)
+            self._marks.discard(mark_key)
         self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
         self.marks_changed.emit(len(self._marks))
         return True
 
-    def article_at(self, row: int) -> header_cache.ArticleRow | None:
-        if 0 <= row < len(self._rows):
-            return self._rows[row]
+    @staticmethod
+    def _mark_key(r: ReleaseRow) -> tuple[str, str]:
+        group = r.articles[0].group if r.articles else ""
+        return (group, r.key)
+
+    def release_at(self, row: int) -> ReleaseRow | None:
+        if 0 <= row < len(self._releases):
+            return self._releases[row]
         return None
 
-    def total_known(self) -> int:
-        return self._total
+    def total_releases(self) -> int:
+        return len(self._releases)
+
+    def total_articles(self) -> int:
+        return sum(r.segments_have for r in self._releases)
 
 
 def _fmt_bytes(n: int) -> str:
     if n <= 0:
         return ""
+    val = float(n)
     for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
+        if val < 1024:
+            return f"{val:.0f} {unit}" if unit == "B" else f"{val:.1f} {unit}"
+        val /= 1024
+    return f"{val:.1f} TB"
+
+
+def _fmt_date(unix_ts: int) -> str:
+    if unix_ts <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(unix_ts).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _fmt_segments(r: ReleaseRow) -> str:
+    if r.segments_expected and r.segments_expected != r.segments_have:
+        return f"{r.segments_have}/{r.segments_expected}"
+    if r.segments_expected:
+        return f"{r.segments_have}/{r.segments_expected}"
+    return str(r.segments_have)
 
 
 class HeaderView(QWidget):
-    article_activated = Signal(object)  # ArticleRow
+    article_activated = Signal(object)  # ArticleRow (erstes Segment des Releases)
     save_nzb_requested = Signal(list)   # list[ArticleRow]
     submit_sab_requested = Signal(list)  # list[ArticleRow]
 
@@ -277,10 +276,10 @@ class HeaderView(QWidget):
         self._table.verticalHeader().setVisible(False)
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(_COL_CHECK, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(_COL_NUMBER, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_SUBJECT, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(_COL_FROM, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(_COL_SEGS, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(_COL_BYTES, QHeaderView.ResizeMode.ResizeToContents)
         self._table.doubleClicked.connect(self._on_double_clicked)
         layout.addWidget(self._table, 1)
@@ -294,8 +293,6 @@ class HeaderView(QWidget):
         self._btn_save_nzb = QPushButton("NZB speichern…", self)
         self._btn_save_nzb.clicked.connect(self._on_save_nzb)
         self._btn_submit_sab = QPushButton("→ SABnzbd", self)
-        self._btn_submit_sab.setEnabled(False)
-        self._btn_submit_sab.setToolTip("Phase 5: SABnzbd-Integration")
         self._btn_submit_sab.clicked.connect(self._on_submit_sab)
         action_row.addWidget(self._btn_clear_marks)
         action_row.addWidget(self._btn_save_nzb)
@@ -335,14 +332,14 @@ class HeaderView(QWidget):
         cur = self._table.currentIndex()
         target = cur.row() + delta if cur.isValid() else (0 if delta > 0 else rows - 1)
         target = max(0, min(rows - 1, target))
-        idx = proxy.index(target, _COL_NUMBER)
+        idx = proxy.index(target, _COL_SUBJECT)
         self._table.setCurrentIndex(idx)
         self._table.scrollTo(idx)
-        # Body sofort laden (entspricht Doppelklick)
+        # Body laden: erstes Segment des Release-Eintrags.
         src = proxy.mapToSource(idx)
-        article = self._model.article_at(src.row())
-        if article is not None:
-            self.article_activated.emit(article)
+        release = self._model.release_at(src.row())
+        if release and release.articles:
+            self.article_activated.emit(release.articles[0])
 
     def toggle_mark_current(self) -> None:
         proxy = self._table.model()
@@ -379,15 +376,21 @@ class HeaderView(QWidget):
         if not grp:
             self._status.setText("Keine Gruppe ausgewählt")
             return
-        total = self._model.total_known()
+        rel = self._model.total_releases()
+        art = self._model.total_articles()
         if searching:
-            self._status.setText(f"Suche {query!r} in {grp}: {total} Treffer")
+            self._status.setText(
+                f"Suche {query!r} in {grp}: {rel} Releases ({art} Artikel)"
+            )
         else:
-            self._status.setText(f"{grp}: {total} Artikel im Cache")
+            self._status.setText(
+                f"{grp}: {rel} Releases ({art} Artikel im Cache)"
+            )
 
     def _on_marks_changed(self, count: int) -> None:
         self._mark_status.setText(f"{count} markiert")
         self._btn_save_nzb.setEnabled(count > 0)
+        self._btn_submit_sab.setEnabled(count > 0)
         self._btn_clear_marks.setEnabled(count > 0)
 
     def _on_double_clicked(self, proxy_index) -> None:
@@ -396,9 +399,9 @@ class HeaderView(QWidget):
         # Doppelklick auf die Check-Spalte schaltet Häkchen, nicht Body
         if src_index.column() == _COL_CHECK:
             return
-        article = self._model.article_at(src_index.row())
-        if article is not None:
-            self.article_activated.emit(article)
+        release = self._model.release_at(src_index.row())
+        if release and release.articles:
+            self.article_activated.emit(release.articles[0])
 
     def _on_save_nzb(self) -> None:
         marked = self._model.marked_articles()

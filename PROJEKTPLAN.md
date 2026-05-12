@@ -1,4 +1,4 @@
-# Usenet-App – Projektplan
+# Achims Usenet-App – Projektplan
 
 Desktop-App für Kali Linux: Newsgroup-Reader (Text + Binär) mit NZB-Erstellung
 aus markierten Artikeln. Downloads werden an SABnzbd delegiert.

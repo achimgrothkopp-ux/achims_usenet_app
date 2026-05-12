@@ -19,11 +19,11 @@ def main() -> None:
     log_file = configure_logging(cfg.logging.level, cfg.logging.log_dir)
 
     log = logging.getLogger("usenet-app")
-    log.info("Starte Usenet-App – Logfile: %s", log_file)
+    log.info("Starte Achims Usenet-App – Logfile: %s", log_file)
     log.info("Config-Quelle: %s", cfg.source_path)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Usenet-App")
+    app.setApplicationName("Achims Usenet-App")
     app.setOrganizationName("local")
 
     loop = qasync.QEventLoop(app)

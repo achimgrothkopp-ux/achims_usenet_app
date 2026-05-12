@@ -1,4 +1,4 @@
-# Usenet-App
+# Achims Usenet-App
 
 Desktop-Newsreader für Kali Linux: Text- und Binär-Gruppen lesen, Header-Cache
 mit FTS5-Suche, NZB-Builder aus markierten Artikeln, Übergabe an SABnzbd.
@@ -164,7 +164,7 @@ usenet/
 - Header-Cache (SQLite, WAL-Mode): `~/.local/share/usenet-app/header_cache.sqlite3`
 - Logfile (rotiert, 2 MB × 5): `~/.local/share/usenet-app/logs/usenet-app.log`
 - Window-Layout: `QSettings` (Plattform-Default, auf Linux meist
-  `~/.config/local/Usenet-App.conf`)
+  `~/.config/local/Achims Usenet-App.conf`)
 
 ## Phasen-Stand
 

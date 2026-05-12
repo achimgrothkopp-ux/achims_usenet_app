@@ -68,7 +68,10 @@ def parse_subject(subject: str) -> ParsedSubject:
     `(part/total)` am Ende. Das `[file/total]` davor lassen wir im
     Stem stehen – es identifiziert die Datei.
     """
-    s = subject.strip()
+    # yEnc zuerst strippen — manche Poster setzen den Marker hinter das
+    # `(N/M)`-Suffix ("Foo.rar (1/1) yEnc"), dann muss `(N/M)` als neuer
+    # Trailer erkennbar werden.
+    s = _YENC_RE.sub("", subject.strip()).rstrip()
     m = _PART_RE.search(s)
     part_no: int | None = None
     part_total: int | None = None
@@ -76,6 +79,8 @@ def parse_subject(subject: str) -> ParsedSubject:
         part_no = int(m.group(1))
         part_total = int(m.group(2))
         s = s[: m.start()].rstrip()
+    # Falls der Poster yEnc *zwischen* "...." und (N/M) gesetzt hat:
+    # nach dem (N/M)-Strip kann noch ein zweites yEnc übrig sein.
     s = _YENC_RE.sub("", s).rstrip()
     return ParsedSubject(stem=s, part_no=part_no, part_total=part_total)
 
