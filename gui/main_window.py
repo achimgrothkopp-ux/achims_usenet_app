@@ -57,7 +57,7 @@ class MainWindow(QMainWindow):
         self._cache = cache
         self._pool = pool
         self._sab = sab
-        self._settings = QSettings("local", "Usenet-App")
+        self._settings = QSettings("local", "Achims Usenet-App")
         # Pro laufendem Sync ein Cancel-Event; Stop-Button setzt das Event,
         # die sync_group-Schleife checkt es zwischen Chunks.
         self._syncing: dict[str, asyncio.Event] = {}
@@ -99,7 +99,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(reset_layout)
 
         help_menu = menubar.addMenu("&Hilfe")
-        about_action = QAction("&Über Usenet-App…", self)
+        about_action = QAction("&Über Achims Usenet-App…", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
@@ -405,10 +405,11 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         QMessageBox.about(
             self,
-            "Über Usenet-App",
-            "<h3>Usenet-App</h3>"
+            "Über Achims Usenet-App",
+            "<h3>Achims Usenet-App</h3>"
             "<p>Newsreader + NZB-Builder mit SABnzbd-Anbindung.</p>"
-            "<p>Phase 6-Build · Python 3.13 · PySide6 · pynntp · httpx · lxml</p>",
+            "<p>Autor: Achim Grothkopp, Mai 2026</p>"
+            "<p>Co-Autor: ClaudeCode, Modell: Opus 4.7</p>",
         )
 
     # ---- Lifecycle -----------------------------------------------------
