@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import email.utils
 import logging
 import sys
 import time
@@ -17,6 +16,7 @@ from nntp.types import Newsgroup, SSLMode
 from config import NNTPConfig
 from config import load as load_config
 from core import header_cache
+from core.dates import parse_nntp_date, parse_nntp_date_unix
 from core.logging_setup import configure as configure_logging
 
 log = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ class HeaderRow:
     date: str
     bytes: int
     lines: int
+    date_unix: int = 0  # parsed aus date, 0 = nicht parsbar
 
 
 def _sanitize(s: str) -> str:
@@ -58,14 +59,16 @@ def _parse_header(number: int, hd) -> HeaderRow:
         except (TypeError, ValueError):
             return 0
 
+    date_str = g("date")
     return HeaderRow(
         number=int(number),
         message_id=g("message-id"),
         subject=g("subject"),
         from_addr=g("from"),
-        date=g("date"),
+        date=date_str,
         bytes=gi("bytes") or gi(":bytes"),
         lines=gi("lines") or gi(":lines"),
+        date_unix=parse_nntp_date_unix(date_str),
     )
 
 
@@ -232,21 +235,6 @@ class SyncPlan:
         return cls(mode="full", max_articles=max_articles)
 
 
-def _parse_nntp_date(s: str) -> datetime | None:
-    """RFC-2822-Datum aus dem Date-Header → tz-aware datetime, oder None."""
-    if not s:
-        return None
-    try:
-        dt = email.utils.parsedate_to_datetime(s)
-    except (TypeError, ValueError):
-        return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
 async def find_article_at_date(
     pool: "NNTPPool",
     group: str,
@@ -279,7 +267,7 @@ async def find_article_at_date(
         end = min(num + window, high)
         rows = await pool.fetch_headers(group, num, end)
         for r in rows:
-            dt = _parse_nntp_date(r.date)
+            dt = parse_nntp_date(r.date)
             if dt is not None:
                 return r.number, dt
         return None

@@ -32,6 +32,12 @@ _SEARCH_LIMIT = 1000
 _COL_CHECK, _COL_NUMBER, _COL_SUBJECT, _COL_FROM, _COL_DATE, _COL_BYTES = range(6)
 _COLUMNS = ("✓", "Nr.", "Subject", "From", "Datum", "Bytes")
 
+# Eigene Sort-Rolle, damit das Datum nach Unix-Timestamp (int) sortiert
+# wird statt nach RFC-2822-String. Andere Spalten liefern hier ebenfalls
+# einen typisierten Wert, sodass auch "Bytes" und "Nr." sauber numerisch
+# sortieren.
+_SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+
 
 @dataclass
 class _Mode:
@@ -176,6 +182,14 @@ class HeaderModel(QAbstractTableModel):
             if col == _COL_FROM: return row.from_addr
             if col == _COL_DATE: return row.date
             if col == _COL_BYTES: return _fmt_bytes(row.bytes)
+        elif role == _SORT_ROLE:
+            if col == _COL_NUMBER: return row.number
+            if col == _COL_SUBJECT: return row.subject
+            if col == _COL_FROM: return row.from_addr
+            if col == _COL_DATE: return row.date_unix
+            if col == _COL_BYTES: return row.bytes
+            if col == _COL_CHECK:
+                return 1 if (row.group, row.number) in self._marks else 0
         elif role == Qt.ItemDataRole.ToolTipRole:
             return f"Message-ID: {row.message_id}\nLines: {row.lines}"
         elif role == Qt.ItemDataRole.UserRole:
@@ -254,7 +268,7 @@ class HeaderView(QWidget):
         self._table = QTableView(self)
         proxy = QSortFilterProxyModel(self)
         proxy.setSourceModel(self._model)
-        proxy.setSortRole(Qt.ItemDataRole.DisplayRole)
+        proxy.setSortRole(_SORT_ROLE)
         self._table.setModel(proxy)
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)

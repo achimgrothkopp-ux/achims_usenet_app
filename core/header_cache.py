@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
+from core.dates import parse_nntp_date_unix
+
 if TYPE_CHECKING:
     from core.nntp_client import HeaderRow
 
@@ -36,10 +38,14 @@ CREATE TABLE IF NOT EXISTS articles (
     date        TEXT NOT NULL,
     bytes       INTEGER NOT NULL DEFAULT 0,
     lines       INTEGER NOT NULL DEFAULT 0,
+    date_unix   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (group_name, number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_articles_msgid ON articles(message_id);
+-- idx_articles_date_unix wird in _migrate_date_unix_locked() erzeugt,
+-- erst nachdem die Spalte sicher existiert (alte DBs brauchen ein
+-- ALTER TABLE davor).
 
 CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
     subject,
@@ -91,6 +97,7 @@ class ArticleRow:
     date: str
     bytes: int
     lines: int
+    date_unix: int = 0
 
 
 class HeaderCache:
@@ -108,6 +115,71 @@ class HeaderCache:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_date_unix_locked()
+
+    def _migrate_date_unix_locked(self) -> None:
+        """Migration für DBs, die vor der date_unix-Spalte angelegt wurden.
+
+        Idempotent: ADD COLUMN nur, wenn fehlt; Backfill nur für Zeilen,
+        die noch nicht aus dem Date-String geparst wurden. Unparsbare
+        Datümer bekommen -1, damit der Backfill sie beim nächsten Start
+        nicht endlos wiederholt.
+        """
+        import time
+
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(articles)")}
+        if "date_unix" not in cols:
+            log.info("Migration: ALTER TABLE articles ADD COLUMN date_unix")
+            self._conn.execute(
+                "ALTER TABLE articles ADD COLUMN date_unix INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # Index für frische DBs ebenso wie für migrierte DBs.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_articles_date_unix "
+            "ON articles(group_name, date_unix)"
+        )
+
+        cnt = self._conn.execute(
+            "SELECT COUNT(*) FROM articles WHERE date_unix = 0 AND date != ''"
+        ).fetchone()[0]
+        if cnt == 0:
+            return
+
+        log.info("Backfill date_unix für %d Zeilen …", cnt)
+        t0 = time.monotonic()
+        BATCH = 10_000
+        last_rowid = 0
+        done = 0
+        while True:
+            rows = self._conn.execute(
+                "SELECT rowid, date FROM articles "
+                "WHERE date_unix = 0 AND date != '' AND rowid > ? "
+                "ORDER BY rowid LIMIT ?",
+                (last_rowid, BATCH),
+            ).fetchall()
+            if not rows:
+                break
+            updates = []
+            for r in rows:
+                unix = parse_nntp_date_unix(r["date"])
+                # -1 = "versucht, nicht parsbar" → beim nächsten Start überspringen
+                updates.append((unix if unix > 0 else -1, r["rowid"]))
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.executemany(
+                    "UPDATE articles SET date_unix = ? WHERE rowid = ?", updates
+                )
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+            done += len(updates)
+            last_rowid = rows[-1]["rowid"]
+
+        dt = time.monotonic() - t0
+        log.info("Backfill date_unix fertig: %d Zeilen in %.1fs", done, dt)
 
     def close(self) -> None:
         with self._lock:
@@ -211,6 +283,9 @@ class HeaderCache:
                 r.date,
                 r.bytes,
                 r.lines,
+                # -1 = "Datum vorhanden, aber nicht parsbar" – konsistent
+                # zur Migration, vermeidet Backfill-Loops für solche Rows.
+                r.date_unix if r.date_unix > 0 else (-1 if r.date else 0),
             )
             for r in rows
         ]
@@ -226,8 +301,8 @@ class HeaderCache:
                 ).fetchone()[0]
                 cur.executemany(
                     """
-                    INSERT INTO articles(group_name, number, message_id, subject, from_addr, date, bytes, lines)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO articles(group_name, number, message_id, subject, from_addr, date, bytes, lines, date_unix)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(group_name, number) DO NOTHING
                     """,
                     payload,
@@ -285,7 +360,7 @@ class HeaderCache:
     def get_article(self, group: str, number: int) -> ArticleRow | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines "
+                "SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines, date_unix "
                 "FROM articles WHERE group_name = ? AND number = ?",
                 (group, number),
             ).fetchone()
@@ -302,7 +377,7 @@ class HeaderCache:
         order_sql = "DESC" if order.lower() == "desc" else "ASC"
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines "
+                f"SELECT group_name, number, message_id, subject, from_addr, date, bytes, lines, date_unix "
                 f"FROM articles WHERE group_name = ? ORDER BY number {order_sql} LIMIT ? OFFSET ?",
                 (group, int(limit), int(offset)),
             ).fetchall()
@@ -344,7 +419,7 @@ class HeaderCache:
         sql = (
             "SELECT articles.group_name, articles.number, articles.message_id, "
             "       articles.subject, articles.from_addr, articles.date, "
-            "       articles.bytes, articles.lines "
+            "       articles.bytes, articles.lines, articles.date_unix "
             "FROM articles_fts "
             "JOIN articles "
             "  ON articles.group_name = articles_fts.group_name "
@@ -372,4 +447,5 @@ class HeaderCache:
             date=r["date"],
             bytes=int(r["bytes"]),
             lines=int(r["lines"]),
+            date_unix=int(r["date_unix"]),
         )
