@@ -169,7 +169,12 @@ class NNTPPool:
 
     async def list_active(self, pattern: str | None = None) -> list[Newsgroup]:
         async with self.acquire() as c:
-            return await asyncio.to_thread(lambda: list(c.list_active(pattern)))
+            raw = await asyncio.to_thread(lambda: list(c.list_active(pattern)))
+        # pynntp parst LIST ACTIVE als (name, low, high, status), das Protokoll
+        # liefert aber "name high low status" (RFC 3977 §7.6.2.2). Wir tauschen
+        # zurück, damit die Invariante low <= high konsistent zum group()-Output
+        # gilt – sonst wäre g.low oft die *größere* Zahl.
+        return [Newsgroup(g.name, g.high, g.low, g.status) for g in raw]
 
     async def group_info(self, name: str) -> tuple[int, int, int]:
         """(count, low, high) der Gruppe."""

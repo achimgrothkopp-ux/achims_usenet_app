@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
-    QInputDialog,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -16,11 +14,9 @@ from PySide6.QtWidgets import (
 )
 
 from core import header_cache, nntp_client
-from gui.dialogs import confirm_async, warn_later
+from gui.group_browser import GroupBrowser
 
 log = logging.getLogger(__name__)
-
-SUBSCRIBE_WARN_THRESHOLD = 1_000_000
 
 
 class GroupPanel(QWidget):
@@ -110,53 +106,11 @@ class GroupPanel(QWidget):
             self.group_selected.emit(name)
 
     def _on_subscribe_clicked(self) -> None:
-        name, ok = QInputDialog.getText(
-            self,
-            "Gruppe abonnieren",
-            "Gruppen-Name (z.B. de.alt.test):",
-        )
-        if not ok or not name.strip():
-            return
-        asyncio.ensure_future(self._subscribe_async(name.strip()))
-
-    async def _subscribe_async(self, name: str) -> None:
-        try:
-            count, low, high = await self._pool.group_info(name)
-        except Exception as exc:
-            log.warning("Subscribe %s fehlgeschlagen: %s", name, exc)
-            warn_later(self, "Subscribe", f"Server kennt {name!r} nicht:\n{exc}")
-            return
-
-        if count > SUBSCRIBE_WARN_THRESHOLD:
-            est_min = count / 200_000
-            est_gb = count * 0.7 / 1_000_000
-            ok = await confirm_async(
-                self,
-                "Große Gruppe",
-                f"{name} hat {count:,} Artikel.\n\n"
-                f"Vollsync würde geschätzt ~{est_min:,.0f} Minuten brauchen "
-                f"und ~{est_gb:,.1f} GB Cache produzieren.\n\n"
-                "Trotzdem abonnieren? (Du kannst danach selbst entscheiden, "
-                "ob du syncen willst.)",
-            )
-            if not ok:
-                self._statusbar_msg("Abo abgebrochen")
-                return
-
-        await asyncio.to_thread(self._cache.upsert_group, name, low, high, None, None)
-        await asyncio.to_thread(self._cache.set_subscribed, name, True)
-        log.info("Abonniert: %s (low=%s high=%s, %s Artikel)", name, low, high, count)
-        self.refresh()
-
-    def _statusbar_msg(self, text: str) -> None:
-        # GroupPanel kennt das MainWindow nicht direkt; wir holen uns den
-        # nächstgelegenen QMainWindow-Vorfahren, falls vorhanden.
-        from PySide6.QtWidgets import QMainWindow
-        w = self.parent()
-        while w is not None and not isinstance(w, QMainWindow):
-            w = w.parent()
-        if isinstance(w, QMainWindow):
-            w.statusBar().showMessage(text, 3000)
+        # Browser bietet Filter, Mehrfach-Subscribe und LIST-ACTIVE-Refresh.
+        # show_for hält den Dialog am Leben (non-modal); subscribed_changed
+        # → unsere refresh() für die linke Panel-Liste.
+        self._browser = GroupBrowser.show_for(self, self._cache, self._pool)
+        self._browser.subscribed_changed.connect(self.refresh)
 
     def _on_unsubscribe_clicked(self) -> None:
         name = self.current_group()

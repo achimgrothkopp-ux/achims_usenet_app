@@ -232,6 +232,56 @@ class HeaderCache:
             ).fetchall()
         return [self._group_row(r) for r in rows]
 
+    def list_all_groups(self, *, name_like: str | None = None) -> list[GroupRow]:
+        """Alle bekannten Gruppen (subscribed + nur-aus-LIST-ACTIVE).
+
+        `name_like` ist eine SQL-LIKE-Pattern (z.B. '%binaries%'). None liefert alles.
+        """
+        sql = (
+            "SELECT name, low_number, high_number, last_article_seen, subscribed, status "
+            "FROM groups"
+        )
+        params: list = []
+        if name_like:
+            sql += " WHERE name LIKE ?"
+            params.append(name_like)
+        sql += " ORDER BY name"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._group_row(r) for r in rows]
+
+    def upsert_groups_bulk(self, rows: Iterable[tuple[str, int, int, str | None]]) -> int:
+        """Bulk-Insert/Update vieler Gruppen aus LIST ACTIVE.
+
+        Erwartet Tupel (name, low, high, status). subscribed und
+        last_article_seen werden NICHT angefasst – das gehört dem
+        Abonnenten-Workflow.
+        Liefert die Anzahl getouchter Zeilen (insgesamt eingespielter Rows).
+        """
+        payload = list(rows)
+        if not payload:
+            return 0
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.executemany(
+                    """
+                    INSERT INTO groups(name, low_number, high_number, status)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(name) DO UPDATE SET
+                        low_number  = excluded.low_number,
+                        high_number = excluded.high_number,
+                        status      = COALESCE(excluded.status, groups.status)
+                    """,
+                    payload,
+                )
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+        return len(payload)
+
     def get_group(self, name: str) -> GroupRow | None:
         with self._lock:
             row = self._conn.execute(
