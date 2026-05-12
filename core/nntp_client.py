@@ -88,6 +88,10 @@ class NNTPPool:
         self._lock = asyncio.Lock()
         self._closed = False
 
+    @property
+    def max_connections(self) -> int:
+        return self._max
+
     def _connect_blocking(self) -> NNTPClient:
         log.debug("NNTP connect → %s:%s (TLS=%s)", self._cfg.host, self._cfg.port, self._cfg.use_tls)
         client = NNTPClient(
@@ -217,22 +221,36 @@ class SyncPlan:
     last_n: int | None = None
     since: datetime | None = None
     max_articles: int | None = None
+    # Anzahl paralleler NNTP-Connections für den Header-Fetch. 1 = sequentiell.
+    # Inserts in SQLite bleiben serialisiert (state_lock); parallel ist hier
+    # nur der netzwerk-bound XOVER-Roundtrip.
+    parallel: int = 1
 
     @classmethod
-    def incremental(cls, *, max_articles: int | None = None) -> "SyncPlan":
-        return cls(mode="incremental", max_articles=max_articles)
+    def incremental(
+        cls, *, max_articles: int | None = None, parallel: int = 1
+    ) -> "SyncPlan":
+        return cls(mode="incremental", max_articles=max_articles, parallel=parallel)
 
     @classmethod
-    def last_n_articles(cls, n: int, *, max_articles: int | None = None) -> "SyncPlan":
-        return cls(mode="last_n", last_n=int(n), max_articles=max_articles)
+    def last_n_articles(
+        cls, n: int, *, max_articles: int | None = None, parallel: int = 1
+    ) -> "SyncPlan":
+        return cls(
+            mode="last_n", last_n=int(n), max_articles=max_articles, parallel=parallel
+        )
 
     @classmethod
-    def since_date(cls, dt: datetime, *, max_articles: int | None = None) -> "SyncPlan":
-        return cls(mode="since_date", since=dt, max_articles=max_articles)
+    def since_date(
+        cls, dt: datetime, *, max_articles: int | None = None, parallel: int = 1
+    ) -> "SyncPlan":
+        return cls(
+            mode="since_date", since=dt, max_articles=max_articles, parallel=parallel
+        )
 
     @classmethod
-    def full(cls, *, max_articles: int | None = None) -> "SyncPlan":
-        return cls(mode="full", max_articles=max_articles)
+    def full(cls, *, max_articles: int | None = None, parallel: int = 1) -> "SyncPlan":
+        return cls(mode="full", max_articles=max_articles, parallel=parallel)
 
 
 async def find_article_at_date(
@@ -354,41 +372,81 @@ async def sync_group(
 
     await asyncio.to_thread(cache.upsert_group, group, low, high, last_seen, None)
 
+    # Chunk-Plan vorab: deterministische Liste konsekutiver Article-Ranges.
+    chunks: list[tuple[int, int]] = []
+    cs = start
+    while cs <= end_limit:
+        chunks.append((cs, min(cs + BATCH_SIZE - 1, end_limit)))
+        cs = chunks[-1][1] + 1
+    n_workers = max(1, plan.parallel)
+
     inserted_total = 0
-    chunk_start = start
+    done = [False] * len(chunks)
+    done_until = -1  # höchster Index, dessen Präfix lückenlos fertig ist
+    state_lock = asyncio.Lock()
+    fetch_error: Exception | None = None
     t0 = time.monotonic()
-    aborted = False
 
-    while chunk_start <= end_limit:
-        if cancel is not None and cancel.is_set():
-            log.info("Sync %s abgebrochen bei #%s", group, chunk_start)
-            aborted = True
-            break
-        chunk_end = min(chunk_start + BATCH_SIZE - 1, end_limit)
-        log.info("xover %s [%s..%s]", group, chunk_start, chunk_end)
-        rows = await pool.fetch_headers(group, chunk_start, chunk_end)
-        if rows:
-            inserted = await asyncio.to_thread(cache.insert_articles, group, rows)
-            inserted_total += inserted
-            highest = max(r.number for r in rows)
-            await asyncio.to_thread(cache.set_last_seen, group, highest)
-        else:
-            await asyncio.to_thread(cache.set_last_seen, group, chunk_end)
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for i in range(len(chunks)):
+        queue.put_nowait(i)
 
+    async def commit_prefix_locked(idx_done: int) -> None:
+        """state_lock muss gehalten sein. Markiert idx_done fertig und schiebt
+        last_seen so weit vor, wie das Anfangs-Präfix lückenlos abgehakt ist."""
+        nonlocal done_until
+        done[idx_done] = True
+        while done_until + 1 < len(chunks) and done[done_until + 1]:
+            done_until += 1
+            await asyncio.to_thread(cache.set_last_seen, group, chunks[done_until][1])
         if progress is not None:
-            progress(chunk_end, end_limit, inserted_total)
+            cur = chunks[done_until][1] if done_until >= 0 else start - 1
+            progress(cur, end_limit, inserted_total)
 
-        chunk_start = chunk_end + 1
+    async def worker() -> None:
+        nonlocal inserted_total, fetch_error
+        while True:
+            # Cancel stoppt nur das Ziehen neuer Chunks. Wer schon einen
+            # gefetched hat, persistiert ihn fertig – sonst wäre der
+            # Netzwerk-Roundtrip verschenkt und last_seen würde
+            # unnötig hinter dem fetched-Stand hinterherhinken.
+            if cancel is not None and cancel.is_set():
+                return
+            try:
+                idx = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            cs_, ce_ = chunks[idx]
+            log.info("xover %s [%s..%s]", group, cs_, ce_)
+            try:
+                rows = await pool.fetch_headers(group, cs_, ce_)
+            except Exception as exc:
+                log.exception("fetch_headers fehlgeschlagen [%s..%s]", cs_, ce_)
+                fetch_error = exc
+                if cancel is not None:
+                    cancel.set()
+                return
+            async with state_lock:
+                if rows:
+                    inserted = await asyncio.to_thread(cache.insert_articles, group, rows)
+                    inserted_total += inserted
+                await commit_prefix_locked(idx)
 
+    await asyncio.gather(*[worker() for _ in range(n_workers)])
+
+    aborted = cancel is not None and cancel.is_set()
     dt = time.monotonic() - t0
     log.info(
-        "Sync %s %s: %s neue Artikel in %.1fs (%.0f/s)",
+        "Sync %s %s: %s neue Artikel in %.1fs (%.0f/s, parallel=%d)",
         group,
         "abgebrochen" if aborted else "fertig",
         inserted_total,
         dt,
         inserted_total / dt if dt > 0 else 0.0,
+        n_workers,
     )
+    if fetch_error is not None:
+        raise fetch_error
     return inserted_total
 
 
@@ -407,6 +465,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--last-n", type=int, metavar="N", help="Nur die letzten N Article-Nummern syncen")
     mode.add_argument("--since", metavar="YYYY-MM-DD", help="Ab Datum syncen (Bisection)")
     sp.add_argument("--max-articles", type=int, metavar="N", help="Pro-Sync-Cap: höchstens N Article-Numbers")
+    sp.add_argument("--parallel", type=int, default=1, metavar="N", help="Parallele Connections fürs Header-Fetching (Default 1)")
 
     sp = sub.add_parser("search", help="FTS5-Suche im Cache")
     sp.add_argument("query")
@@ -440,15 +499,16 @@ async def _amain(args: argparse.Namespace) -> int:
                 pct = 100.0 * cur / total if total else 100.0
                 print(f"  {args.group}: {cur}/{total} ({pct:5.1f}%)  insgesamt neu: {inserted}", flush=True)
 
+            par = max(1, args.parallel)
             if args.full:
-                plan = SyncPlan.full(max_articles=args.max_articles)
+                plan = SyncPlan.full(max_articles=args.max_articles, parallel=par)
             elif args.last_n is not None:
-                plan = SyncPlan.last_n_articles(args.last_n, max_articles=args.max_articles)
+                plan = SyncPlan.last_n_articles(args.last_n, max_articles=args.max_articles, parallel=par)
             elif args.since:
                 since = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
-                plan = SyncPlan.since_date(since, max_articles=args.max_articles)
+                plan = SyncPlan.since_date(since, max_articles=args.max_articles, parallel=par)
             else:
-                plan = SyncPlan.incremental(max_articles=args.max_articles)
+                plan = SyncPlan.incremental(max_articles=args.max_articles, parallel=par)
 
             n = await sync_group(pool, cache, args.group, plan=plan, progress=_show)
             print(f"Fertig. Neu eingefügt: {n}")

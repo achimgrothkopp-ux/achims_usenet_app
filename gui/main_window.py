@@ -254,6 +254,7 @@ class MainWindow(QMainWindow):
             plan = await SyncDialog.show_for(
                 self, name,
                 low=low, high=high, count=count, last_seen=last_seen,
+                pool_max=self._pool.max_connections,
             )
             if plan is None or cancel.is_set():
                 self._statusbar.showMessage("Sync abgebrochen", 3000)

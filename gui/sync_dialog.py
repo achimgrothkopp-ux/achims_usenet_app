@@ -41,6 +41,7 @@ class SyncDialog(QDialog):
         high: int,
         count: int,
         last_seen: int,
+        pool_max: int = 1,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -49,6 +50,7 @@ class SyncDialog(QDialog):
         self._high = high
         self._count = count
         self._last_seen = last_seen
+        self._pool_max = max(1, pool_max)
 
         self.setWindowTitle(f"Sync: {group}")
         self.setModal(True)
@@ -146,6 +148,19 @@ class SyncDialog(QDialog):
         row_m.layout().addWidget(self._spin_max)
         row_m.layout().addWidget(self._lbl_max_suffix, 1)
         limit_layout.addWidget(row_m)
+
+        # Parallele Connections – 1 ≈ altes Verhalten, mehr = Header-Fetch
+        # über mehrere NNTP-Sockets gleichzeitig. Limitiert auf Pool-Größe.
+        self._spin_parallel = QSpinBox(self)
+        self._spin_parallel.setRange(1, self._pool_max)
+        self._spin_parallel.setValue(self._pool_max)
+        row_p = _row()
+        row_p.layout().addWidget(QLabel("Parallele Connections:", self))
+        row_p.layout().addWidget(self._spin_parallel)
+        row_p.layout().addWidget(
+            QLabel(f"(max {self._pool_max} laut config.toml)", self), 1
+        )
+        limit_layout.addWidget(row_p)
         layout.addWidget(limit_box)
 
         # ---- Schätzung -------------------------------------------------
@@ -220,15 +235,18 @@ class SyncDialog(QDialog):
     @property
     def plan(self) -> SyncPlan:
         max_articles = self._spin_max.value() if self._chk_max.isChecked() else None
+        parallel = self._spin_parallel.value()
         if self._rb_full.isChecked():
-            return SyncPlan.full(max_articles=max_articles)
+            return SyncPlan.full(max_articles=max_articles, parallel=parallel)
         if self._rb_last_n.isChecked():
-            return SyncPlan.last_n_articles(self._spin_last_n.value(), max_articles=max_articles)
+            return SyncPlan.last_n_articles(
+                self._spin_last_n.value(), max_articles=max_articles, parallel=parallel
+            )
         if self._rb_since.isChecked():
             qd = self._date.date()
             since = datetime(qd.year(), qd.month(), qd.day(), tzinfo=timezone.utc)
-            return SyncPlan.since_date(since, max_articles=max_articles)
-        return SyncPlan.incremental(max_articles=max_articles)
+            return SyncPlan.since_date(since, max_articles=max_articles, parallel=parallel)
+        return SyncPlan.incremental(max_articles=max_articles, parallel=parallel)
 
     @staticmethod
     def get_plan(
@@ -239,8 +257,12 @@ class SyncDialog(QDialog):
         high: int,
         count: int,
         last_seen: int,
+        pool_max: int = 1,
     ) -> SyncPlan | None:
-        dlg = SyncDialog(group, low=low, high=high, count=count, last_seen=last_seen, parent=parent)
+        dlg = SyncDialog(
+            group, low=low, high=high, count=count, last_seen=last_seen,
+            pool_max=pool_max, parent=parent,
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
         return dlg.plan
@@ -254,13 +276,17 @@ class SyncDialog(QDialog):
         high: int,
         count: int,
         last_seen: int,
+        pool_max: int = 1,
     ) -> Awaitable["SyncPlan | None"]:
         """Non-modal in den qasync-Loop integrierte Variante von get_plan.
 
         Gibt ein awaitable zurück, das den gewählten Plan (oder None bei
         Abbruch) liefert, ohne die asyncio-Loop zu blockieren (kein .exec()).
         """
-        dlg = SyncDialog(group, low=low, high=high, count=count, last_seen=last_seen, parent=parent)
+        dlg = SyncDialog(
+            group, low=low, high=high, count=count, last_seen=last_seen,
+            pool_max=pool_max, parent=parent,
+        )
         fut: asyncio.Future[SyncPlan | None] = asyncio.get_event_loop().create_future()
 
         def _done(code: int) -> None:
