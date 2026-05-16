@@ -342,12 +342,21 @@ class HeaderCache:
         if not payload:
             return 0
 
+        # Chunk-Range für die COUNT-Begrenzung: payload kommt aus einem
+        # konsekutiven xover-Range, also reicht ein Lookup auf den
+        # (group_name, number)-PK in dieser Fensterspanne (O(chunk_size)
+        # statt O(group_size) wie der frühere Full-Group-Scan).
+        nums = [p[1] for p in payload]
+        lo, hi = min(nums), max(nums)
+
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN")
             try:
                 before = self._conn.execute(
-                    "SELECT COUNT(*) FROM articles WHERE group_name = ?", (group,)
+                    "SELECT COUNT(*) FROM articles "
+                    "WHERE group_name = ? AND number BETWEEN ? AND ?",
+                    (group, lo, hi),
                 ).fetchone()[0]
                 cur.executemany(
                     """
@@ -358,7 +367,9 @@ class HeaderCache:
                     payload,
                 )
                 after = self._conn.execute(
-                    "SELECT COUNT(*) FROM articles WHERE group_name = ?", (group,)
+                    "SELECT COUNT(*) FROM articles "
+                    "WHERE group_name = ? AND number BETWEEN ? AND ?",
+                    (group, lo, hi),
                 ).fetchone()[0]
                 cur.execute("COMMIT")
             except Exception:

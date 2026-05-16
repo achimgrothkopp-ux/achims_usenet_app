@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -57,28 +58,29 @@ class HeaderModel(QAbstractTableModel):
         self._marks: set[tuple[str, str]] = set()
 
     # ---- Mode-Switching --------------------------------------------------
+    # Fetch + group_releases laufen in einem Worker-Thread (siehe HeaderView),
+    # die apply_*-Methoden sind nur noch der GUI-Thread-Apply. Bei Mio-Gruppen
+    # blockt sonst der Klick „Gruppe wählen" die UI sekundenlang.
 
-    def set_group(self, group: str | None) -> None:
+    def apply_browse(self, group: str | None, releases: list[ReleaseRow]) -> None:
         self.beginResetModel()
         self._mode = _Mode(kind="browse", group=group)
-        if group:
-            articles = self._cache.fetch_articles(group, limit=0, order="desc")
-            self._releases = group_releases(articles)
-        else:
-            self._releases = []
+        self._releases = releases
         self.endResetModel()
 
-    def set_search(self, group: str | None, query: str) -> None:
+    def apply_search(
+        self, group: str | None, query: str, releases: list[ReleaseRow]
+    ) -> None:
         self.beginResetModel()
         self._mode = _Mode(kind="search", group=group, query=query)
-        try:
-            articles = self._cache.search_articles(
-                query, group=group, limit=_SEARCH_LIMIT
-            )
-        except Exception as exc:
-            log.warning("FTS-Query fehlgeschlagen: %s", exc)
-            articles = []
-        self._releases = group_releases(articles)
+        self._releases = releases
+        self.endResetModel()
+
+    def clear_view(self, group: str | None) -> None:
+        """Sofortiger Reset auf leere Liste — UI-Feedback während Async-Load."""
+        self.beginResetModel()
+        self._mode = _Mode(kind="browse", group=group)
+        self._releases = []
         self.endResetModel()
 
     def current_group(self) -> str | None:
@@ -243,6 +245,11 @@ class HeaderView(QWidget):
         self._cache = cache
         self._model = HeaderModel(cache, self)
         self._model.marks_changed.connect(self._on_marks_changed)
+        # Monoton wachsender Token; jede Load-Anfrage bumpt ihn. Ein
+        # Worker prüft beim Apply, ob noch der jüngste Token läuft,
+        # sonst wird sein Resultat verworfen — verhindert Race-Conditions
+        # bei schnellen Group-Switches.
+        self._load_token: int = 0
         self._build_ui()
         self._on_marks_changed(0)
 
@@ -305,12 +312,40 @@ class HeaderView(QWidget):
 
     def set_group(self, group: str | None) -> None:
         self._search.clear()
-        self._model.set_group(group)
-        self._update_status()
+        self._schedule_browse(group)
 
     def refresh_current(self) -> None:
-        if self._model.current_group():
-            self.set_group(self._model.current_group())
+        grp = self._model.current_group()
+        if grp:
+            self._schedule_browse(grp)
+
+    def _schedule_browse(self, group: str | None) -> None:
+        self._load_token += 1
+        token = self._load_token
+        # Sofort visuelles Feedback: alte Daten weg, Status auf "Lade …".
+        self._model.clear_view(group)
+        if group is None:
+            self._update_status()
+            return
+        self._status.setText(f"Lade {group} …")
+        asyncio.ensure_future(self._load_browse(group, token))
+
+    async def _load_browse(self, group: str, token: int) -> None:
+        try:
+            releases = await asyncio.to_thread(self._fetch_releases_for_group, group)
+        except Exception as exc:
+            log.exception("Header-Load fehlgeschlagen für %s", group)
+            if token == self._load_token:
+                self._status.setText(f"Laden fehlgeschlagen: {exc}")
+            return
+        if token != self._load_token:
+            return  # neuere Anfrage hat uns überholt
+        self._model.apply_browse(group, releases)
+        self._update_status()
+
+    def _fetch_releases_for_group(self, group: str):
+        articles = self._cache.fetch_articles(group, limit=0, order="desc")
+        return group_releases(articles)
 
     def model(self) -> HeaderModel:
         return self._model
@@ -363,13 +398,32 @@ class HeaderView(QWidget):
         if not query:
             self._clear_search()
             return
-        self._model.set_search(self._model.current_group(), query)
+        grp = self._model.current_group()
+        self._load_token += 1
+        token = self._load_token
+        scope = grp or "allen Gruppen"
+        self._status.setText(f"Suche {query!r} in {scope} …")
+        asyncio.ensure_future(self._load_search(grp, query, token))
+
+    async def _load_search(self, group: str | None, query: str, token: int) -> None:
+        try:
+            articles = await asyncio.to_thread(
+                self._cache.search_articles, query, group=group, limit=_SEARCH_LIMIT
+            )
+        except Exception as exc:
+            log.warning("FTS-Query fehlgeschlagen: %s", exc)
+            if token == self._load_token:
+                self._status.setText(f"Suche fehlgeschlagen: {exc}")
+            return
+        releases = await asyncio.to_thread(group_releases, articles)
+        if token != self._load_token:
+            return
+        self._model.apply_search(group, query, releases)
         self._update_status(searching=True, query=query)
 
     def _clear_search(self) -> None:
         self._search.clear()
-        self._model.set_group(self._model.current_group())
-        self._update_status()
+        self._schedule_browse(self._model.current_group())
 
     def _update_status(self, searching: bool = False, query: str = "") -> None:
         grp = self._model.current_group()
