@@ -218,6 +218,20 @@ kennen. Realisiert (98b0068):
   der Name-Spalte; "Nur Abonnierte zeigen"-Checkbox reduziert den
   Source-Bestand.
 
+### Phase 9 – NZB-Import  ✅
+
+Bisher entstanden NZBs nur aus markierten Headern (Phase 4). Jetzt
+lassen sich auch vorhandene `.nzb`-Dateien von der Platte importieren
+und direkt herunterladen (22e6ae4):
+
+- `Datei → "NZB importieren…"` (Ctrl+O) öffnet einen Multi-Select-
+  `QFileDialog` (`*.nzb`/`*.nzb.gz`).
+- Dateien werden off-thread (`asyncio.to_thread`) gelesen und über das
+  bestehende `SABnzbdClient.add_nzb_bytes` (`addfile`) an SAB übergeben –
+  kein Backend-Code nötig, reine GUI-Erweiterung in `main_window.py`.
+- Fehler werden pro Datei übersprungen (via `critical_later`, nicht
+  modal), am Ende Status-Zusammenfassung + `queue_panel`-Refresh.
+
 ---
 
 ## Geschätzter Gesamtumfang
