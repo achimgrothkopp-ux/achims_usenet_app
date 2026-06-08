@@ -82,6 +82,12 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&Datei")
+        import_nzb_action = QAction("NZB &importieren…", self)
+        import_nzb_action.setShortcut(QKeySequence("Ctrl+O"))
+        import_nzb_action.triggered.connect(self._import_nzb)
+        file_menu.addAction(import_nzb_action)
+
+        file_menu.addSeparator()
         settings_action = QAction("&Einstellungen…", self)
         settings_action.setShortcut(QKeySequence("Ctrl+,"))
         settings_action.triggered.connect(self._open_settings)
@@ -375,6 +381,54 @@ class MainWindow(QMainWindow):
             5000,
         )
         self._queue_panel.trigger_refresh()
+
+    # ---- NZB-Import ----------------------------------------------------
+
+    def _import_nzb(self) -> None:
+        if self._sab is None or not self._sab.configured:
+            QMessageBox.warning(
+                self,
+                "SABnzbd nicht konfiguriert",
+                "Trage in ~/.config/usenet-app/config.toml unter "
+                "[sabnzbd] api_key ein und starte die App neu.",
+            )
+            return
+        paths_str, _ = QFileDialog.getOpenFileNames(
+            self,
+            "NZB-Datei(en) importieren",
+            str(Path.home()),
+            "NZB-Dateien (*.nzb *.nzb.gz);;Alle Dateien (*)",
+        )
+        if not paths_str:
+            return
+        paths = [Path(p) for p in paths_str]
+        asyncio.ensure_future(self._import_nzb_async(paths))
+
+    async def _import_nzb_async(self, paths: list[Path]) -> None:
+        assert self._sab is not None
+        ok = 0
+        for path in paths:
+            self._statusbar.showMessage(f"Importiere NZB: {path.name} …")
+            try:
+                data = await asyncio.to_thread(path.read_bytes)
+            except OSError as exc:
+                log.warning("NZB lesen fehlgeschlagen: %s", exc)
+                critical_later(self, "Import-Fehler", f"{path.name}: {exc}")
+                continue
+            try:
+                nzo_id = await self._sab.add_nzb_bytes(data, filename=path.name)
+            except SABError as exc:
+                log.warning("SAB-Import fehlgeschlagen: %s", exc)
+                self._statusbar.showMessage(f"SAB-Fehler bei {path.name}: {exc}", 6000)
+                continue
+            ok += 1
+            log.info("NZB importiert: %s → nzo_id=%s", path.name, nzo_id)
+
+        if ok:
+            self._statusbar.showMessage(
+                f"{ok} von {len(paths)} NZB-Datei(en) in SABnzbd-Queue", 5000
+            )
+            self._queue_panel.trigger_refresh()
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._cfg, self)
